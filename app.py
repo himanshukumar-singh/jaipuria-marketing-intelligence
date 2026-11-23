@@ -8,8 +8,6 @@ import pandas as pd
 
 import streamlit as st
 
-import plotly.express as px
-
 st.set_page_config(page_title='Jaipuria | Marketing Intelligence',layout='wide',initial_sidebar_state='collapsed')
 
 
@@ -17,10 +15,6 @@ st.set_page_config(page_title='Jaipuria | Marketing Intelligence',layout='wide',
 import re
 
 from pathlib import Path
-
-import pandas as pd
-
-import streamlit as st
 
 import gspread
 
@@ -54,6 +48,10 @@ def dates(x):
 
     m=out.isna(); out.loc[m]=pd.to_datetime(s.loc[m],format='mixed',errors='coerce',dayfirst=False)
 
+    # Some worksheet exports contain Excel numeric date serials (e.g. 46235.59).
+    m=out.isna(); serial=pd.to_numeric(s.loc[m],errors='coerce').where(lambda z:z.between(30000,90000))
+    out.loc[m]=pd.to_datetime(serial,unit='D',origin='1899-12-30',errors='coerce')
+
     return out
 
 
@@ -86,7 +84,15 @@ def email(rows,batch,kind):
 
     auto=kind=='Automation'; date=dates(col(d,'Date' if auto else 'Scheduled On')); delivered=num(col(d,'Delivered')); opened=num(col(d,'Opens (sorted descending)' if auto else 'Opens')); clicks=num(col(d,'Clicks'))
 
-    if auto: opened=opened*delivered/100; clicks=clicks*delivered/100
+    if auto:
+        # Google FORMATTED_VALUE may return '9.39%' while unformatted Excel
+        # exports may return its numeric fraction 0.0939. Support both.
+        oraw=col(d,'Opens (sorted descending)').astype(str)
+        craw=col(d,'Clicks').astype(str)
+        opened=opened.mask((~oraw.str.contains('%',regex=False)) & opened.between(0,1),opened*100)
+        clicks=clicks.mask((~craw.str.contains('%',regex=False)) & clicks.between(0,1),clicks*100)
+        opened=opened*delivered/100
+        clicks=clicks*delivered/100
 
     out=pd.DataFrame({'Batch':batch,'Type':kind,'Date':date,'Campaign':clean(col(d,'Automation Name' if auto else 'Campaign Name')),'Subject':clean(col(d,'Subject')),'Delivered':delivered,'Opened':opened,'Clicked':clicks})
 
@@ -122,6 +128,30 @@ def wa(rows,batch,kind):
 
 
 
+def voucher_records(rows, batch):
+    """Unique paid applications per voucher. All sources qualify, not only Emailer/WhatsApp."""
+    d = frame(rows)
+    names = ['Voucher Student Code', 'Voucher Student Code Secondary', 'Payment Status',
+             'Application Id', 'Transaction Id', 'Transaction Date']
+    for name in names:
+        col(d, name)
+    if d.empty:
+        return pd.DataFrame(columns=['Batch', 'Voucher', 'Application ID', 'Payment Status', 'Transaction ID', 'Date'])
+    primary = clean(d['Voucher Student Code']).replace({'nan': '', 'None': ''})
+    secondary = clean(d['Voucher Student Code Secondary']).replace({'nan': '', 'None': ''})
+    code = primary.mask(primary.eq(''), secondary).str.strip()
+    status = clean(d['Payment Status'])
+    appid = clean(d['Application Id']).replace({'nan': '', 'None': ''})
+    tid = clean(d['Transaction Id']).replace({'nan': '', 'None': ''})
+    o = pd.DataFrame({'Batch': batch, 'Voucher': code, 'Application ID': appid,
+                      'Payment Status': status, 'Transaction ID': tid,
+                      'Date': dates(d['Transaction Date'])})
+    o = o[(o['Voucher'] != '') & (o['Application ID'] != '') &
+          (o['Payment Status'].str.casefold() == 'paid') & o['Date'].notna()].copy()
+    o['Voucher'] = o['Voucher'].str.upper()
+    # Same paid application may be repeated in exports. Count it once per batch & voucher.
+    return o.drop_duplicates(subset=['Batch', 'Voucher', 'Application ID'])
+
 def senders(rows,batch):
 
     d=frame(rows)
@@ -144,7 +174,7 @@ def load():
 
         raise RuntimeError(f'Credential setup: {type(exc).__name__}: {exc!s}' ) from exc
 
-    all_data={k:[] for k in ['transactions','email','wa','chat','senders']}
+    all_data={k:[] for k in ['transactions','email','wa','chat','senders','voucher']}
 
     for batch, secret_name in BOOKS.items():
         key = str(st.secrets['marketing_sheets'][secret_name]).strip()
@@ -163,15 +193,16 @@ def load():
 
         # Only required transaction columns: one header read and one batch request.
 
-        t=tabs['Transaction Details']; headers=t.row_values(1); fields=['Transaction Date','Marketing Portal Source','Marketing Portal Source Medium','Marketing Portal Source Campaign']; ranges=[]
+        t=tabs['Transaction Details']; headers=t.row_values(1); fields=['Transaction Date','Marketing Portal Source','Marketing Portal Source Medium','Marketing Portal Source Campaign','Voucher Student Code','Voucher Student Code Secondary','Payment Status','Application Id','Transaction Id']; ranges=[]
 
         for f in fields:
 
             j=headers.index(f)+1; letter=re.sub(r'\d','',gspread.utils.rowcol_to_a1(1,j)); ranges.append(f'{letter}2:{letter}{t.row_count}')
 
-        values=t.batch_get(ranges); n=max(map(len,values),default=0); rows=[fields]+[[values[j][i][0] if i<len(values[j]) and values[j][i] else '' for j in range(4)] for i in range(n)]
+        values=t.batch_get(ranges); n=max(map(len,values),default=0); rows=[fields]+[[values[j][i][0] if i<len(values[j]) and values[j][i] else '' for j in range(len(fields))] for i in range(n)]
 
-        all_data['transactions'].append(transactions(rows,batch))
+        all_data['transactions'].append(transactions([fields[:4]]+[r[:4] for r in rows[1:]],batch))
+        all_data['voucher'].append(voucher_records([fields[4:]+['Transaction Date']]+[r[4:]+[r[0]] for r in rows[1:]],batch))
 
         names=['Email Automation','Email Bulk','Whatsapp Automation Summary','Whatsapp Bulk Summary','Converse Chat Summary','Total Emails Sent' if batch=='2026–28' else 'Total Email Sent']
 
@@ -187,7 +218,7 @@ def load():
 
         all_data['chat'].append(wa(r[4],batch,'Converse Chat')); all_data['senders'].append(senders(r[5],batch))
 
-    return {k:pd.concat(v,ignore_index=True) for k,v in all_data.items()}
+    return {k:pd.concat([x for x in v if not x.empty],ignore_index=True) if any(not x.empty for x in v) else v[0].iloc[0:0].copy() for k,v in all_data.items()}
 
 
 
@@ -339,7 +370,7 @@ def svg_chart(d,x,y,group='Batch',kind='bar',width=480,height=210,secondary=None
     if d.empty or y not in d or d[y].notna().sum()==0:return empty('No chart data for this selection.')
     z=d.copy();z=z[z[x].notna()]; cats=sorted(z[x].unique()) if x=='Month' else list(dict.fromkeys(z[x])); groups=list(dict.fromkeys(z[group]));
     if group=='Batch':groups=[b for b in B if b in groups]
-    colors={B[0]:GREEN,B[1]:PURPLE,'Delivered':GREEN,'Opened':ORANGE,'Read':ORANGE,'Sent':GREEN}
+    colors={B[0]:GREEN,B[1]:PURPLE,'Delivered':GREEN,'Opened':ORANGE,'Read':ORANGE,'Sent':GREEN,'Emailer':GREEN,'WhatsApp':ORANGE}
     colors.update({k:colors.get(k,[GREEN,PURPLE,ORANGE][i%3]) for i,k in enumerate(groups)})
     legends=''.join(f'<span class="legenditem"><i class="legenddot" style="background:{colors[k]}"></i>{esc(k)}</span>' for k in groups)
     if secondary is not None:legends+=f'<span class="legenditem"><i class="legenddot" style="background:{PURPLE}"></i>Read rate</span>'
@@ -400,7 +431,7 @@ def donut(d):
         n=nums.get(source,0); co=GREEN if source=='Emailer' else PURPLE; arc=circ*n/tot
         if arc:sv.append(f'<circle cx="100" cy="73" r="{r}" fill="none" stroke="{co}" stroke-width="23" stroke-dasharray="{arc:.3f} {circ-arc:.3f}" stroke-dashoffset="{-offset:.3f}" transform="rotate(-90 100 73)"><title>{esc(source)}: {fmt(n)} ({pct(n/tot*100)})</title></circle>')
         offset+=arc;leg.append(f'<span class="legenditem"><i class="legenddot" style="background:{co}"></i>{esc(source)} {pct(n/tot*100)}</span>')
-    svg='<svg viewBox="0 0 200 148" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Last year channel share">'+''.join(sv)+f'<text x="100" y="71" font-size="25" font-weight="750" text-anchor="middle" fill="{GREEN}">{fmt(tot)}</text><text x="100" y="86" font-size="10" text-anchor="middle" fill="#65766b">Transactions</text></svg>'
+    svg='<svg viewBox="0 0 200 148" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Channel contribution by source">'+''.join(sv)+f'<text x="100" y="71" font-size="25" font-weight="750" text-anchor="middle" fill="{GREEN}">{fmt(tot)}</text><text x="100" y="86" font-size="10" text-anchor="middle" fill="#65766b">Transactions</text></svg>'
     return div(svg+div(''.join(leg),'chart-legend'),'plot')
 
 # Native controls are created once, above every report section.
@@ -421,101 +452,491 @@ def navigation():
     st.markdown('<div class="filter-note">Batch selects campaign and sender rankings; campaign type selects Email/WhatsApp trends and rankings. Date range filters Transactions only. Search filters detail/rankings only. Overview and batch comparison tables remain full-cycle.</div>',unsafe_allow_html=True)
     return batch,kind,start,end,query
 
+
+# ----------------------------------------------------------------------
+# 2026-11-23 correction requirements (10 points): professional report v3.
+# All Google keys remain in Streamlit Secrets. Read-only, refreshed every 60s.
+# ----------------------------------------------------------------------
+PAGES = ['Overview', 'Transactions', 'Email', 'WhatsApp', 'Converse Chat', 'Senders', 'Vouchers']
+CSS_V3 = """
+/* Layout system: 76% report / 24% management insights, shared top/bottom edges. */
+.mi{gap:22px}.section{scroll-margin-top:16px}.section:not(:first-child){padding-top:20px}
+.mi .sectitle{font-size:21px!important;padding:10px 13px!important;margin:0 0 12px!important;background:linear-gradient(90deg,#ecf1e7 0%,white 80%);letter-spacing:-.3px}
+.section-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(255px,24%);align-items:stretch;gap:14px}
+.leftstack{display:flex;flex-direction:column;gap:12px;min-width:0}.rightstack{display:flex;flex-direction:column;min-width:0}
+.rightstack>.insight{flex:1}.rightstack .insight-items{display:flex;flex-direction:column;gap:7px;justify-content:flex-start;flex:0 0 auto}.rightstack .insight-note{margin-top:auto}
+.insight-row{border-left:3px solid #6b9c7a!important;background:#f0f6ef!important;padding:10px 11px!important;min-height:56px;display:flex;align-items:center}
+.insight-row:nth-child(2n){border-left-color:#9b70b6!important;background:#f7f1fa!important}
+.insight-row:nth-child(3n){border-left-color:#eda438!important;background:#fff8ed!important}
+.insight-row b{font-size:11px!important}.insight-value{font-size:12px;line-height:1.4;display:block;margin-top:4px}
+.panel{border-radius:10px;padding:13px}.panel h3{font-size:14px!important}
+.panel .tablebox{max-width:100%;overflow-x:auto}.panel .report th{font-size:10px!important;line-height:1.25}
+.report .num{min-width:58px}.report .txt{overflow-wrap:anywhere}.report .namecell{min-width:140px}
+.kpis{gap:11px}.kpis.four{grid-template-columns:repeat(4,minmax(0,1fr))}.kpi{min-height:100px}
+.kpis.four .kpi{min-height:102px}.kpis.four .kpair .kval{font-size:clamp(17px,1.6vw,23px)}
+.overview-bottom{display:grid;grid-template-columns:minmax(170px,.85fr) repeat(2,minmax(0,1.6fr));gap:11px;align-items:stretch}
+.overview-bottom .panel{padding:11px}.overview-bottom .kpi{height:100%;min-height:132px}
+.tx-top{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,.75fr);gap:12px;align-items:stretch}
+.tx-bottom{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
+.reports-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:stretch}
+.rank-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:stretch}
+.rank-pair .panel{padding:11px;min-width:0}
+.rank-pair .tablebox{max-height:350px;overflow:auto;border:1px solid #e0e9e1}
+.rank-pair .report th{position:sticky;top:0;z-index:3}
+.rank-pair .report td{font-size:11px}.rank-pair .report .secondary{font-size:10px}
+.report tr th:first-child,.report tr td:first-child{text-align:left}
+.subhead{font-weight:800;color:#234835;font-size:13px;border-left:3px solid #e7a23c;margin:10px 0 8px!important;padding:6px 10px;background:#f3f5ef;border-radius:4px}
+.quality-note{font-size:11px;color:#697c72;padding:8px 2px}
+/* Single expandable hierarchy table, with aligned numeric columns. */
+.hier{border:1px solid #e0e8df;border-radius:9px;overflow:hidden;background:white}
+.hier-header,.hier-row{display:grid;grid-template-columns:minmax(0,1fr) 95px 95px;gap:10px;align-items:center;min-width:0}
+.hier-header{background:#e7eee1;padding:10px 12px;font-size:11px;font-weight:800;color:#204b39}
+.hier-row{padding:9px 12px;border-top:1px solid #e6ebe4;font-size:12px;color:#2c4437}
+.hier-row .hier-name{display:flex;align-items:center;gap:7px;min-width:0;overflow-wrap:anywhere}
+.hier .hnum{font-variant-numeric:tabular-nums;text-align:right;font-weight:650;white-space:nowrap}
+.hier details summary{list-style:none;cursor:pointer}.hier details summary::-webkit-details-marker{display:none}
+.hier details summary .hier-name::before{content:'▸';font-size:12px;color:#6f8f72;margin-right:2px}
+.hier details[open]>summary .hier-name::before{content:'▾'}
+.hier-source>summary{background:#eff5e9;font-weight:750}.hier-medium>summary{background:#fafbf8;font-weight:650}
+.hier-medium>summary .hier-name{padding-left:16px}.hier-campaign>.hier-name{padding-left:39px;color:#58705f}
+.hier-footer{background:#dfebd3;font-weight:800}
+.hier-empty{padding:14px;color:#64796c;font-size:12px}
+/* Wide comparisons use a compact bar section, no overstretched table rows. */
+.month-table .tablebox{max-height:280px;overflow:auto}.month-table .report th{position:sticky;top:0;z-index:2}
+.chart-note{font-size:10.5px;color:#698070;margin:6px 0 0}
+.voucher-rank .tablebox{max-height:490px;overflow:auto}.voucher-rank .report th{position:sticky;top:0;z-index:2}
+.voucher-rank .report .num{min-width:80px}.voucher-rank .report .txt{min-width:130px}
+.section-wide{margin-top:12px;display:grid;gap:12px}.section-wide .rank-pair .tablebox{max-height:370px}
+@media(max-width:1250px){.section-grid{grid-template-columns:minmax(0,1fr) minmax(205px,24%)}.rank-pair .report td{padding:6px 5px!important}.overview-bottom{grid-template-columns:1fr 1fr}.overview-bottom>.kpi{grid-column:1/-1}.tx-top{grid-template-columns:minmax(0,1.35fr) minmax(0,.8fr)}}
+@media(max-width:1000px){.section-grid{grid-template-columns:1fr}.rightstack>.insight{flex:auto}.rightstack .insight-items{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.overview-bottom{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:680px){.kpis.four{grid-template-columns:repeat(2,minmax(0,1fr))}.rank-pair,.reports-row,.tx-top,.tx-bottom,.overview-bottom{grid-template-columns:1fr}.rightstack .insight-items{grid-template-columns:1fr}.hier-header,.hier-row{grid-template-columns:minmax(0,1fr) 65px 65px;gap:5px}.brand-text{border-left:0;padding-left:0}.section-grid{gap:9px}}
+
+/* Final desktop/mobile typography & density QA: never squeeze KPI labels or sender tables. */
+.section-grid > .leftstack,.section-grid > .rightstack{min-width:0}
+.panel .report th,.panel .report td{font-variant-numeric:tabular-nums}
+.rightstack .insight{min-width:0}
+.rank-pair .tablebox{scrollbar-width:thin;scrollbar-color:#c3d3c2 transparent}
+.rank-pair .report{min-width:445px}
+.rank-pair .report th{background:#e8eee2!important}
+.voucher-rank .report{min-width:520px}
+.hier-row:focus-visible,.hier summary:focus-visible{outline:2px solid #8053ad;outline-offset:-2px}
+@media(max-width:1000px){
+  .section-grid{grid-template-columns:minmax(0,1fr)}
+  .rightstack>.insight{min-height:0}
+  .rightstack .insight-items{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+  .rightstack .insight-row{min-height:56px}
+}
+@media(max-width:680px){
+  .block-container{padding:10px 13px 22px!important}
+  .brand{gap:10px;flex-wrap:wrap}
+  .brand img{width:128px}
+  .brand-text{flex-basis:calc(100% - 140px);padding-left:0;border-left:0}
+  .brand-name{font-size:18px;letter-spacing:-.2px}
+  .brand-sub{font-size:10px}
+  .brand-badge{display:none}
+  .mi .sectitle{font-size:17px!important}
+  .kpis,.kpis.four,.kpis.five{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .kpi{min-height:91px;padding:10px}
+  .kpair .kval{font-size:17px!important}
+  .klabel{font-size:11px}
+  .overview-bottom,.reports-row,.rank-pair,.tx-top,.tx-bottom,.detail-row{grid-template-columns:1fr}
+  .overview-bottom>.kpi{grid-column:auto}
+  .rightstack .insight-items{grid-template-columns:1fr}
+  .hier-header,.hier-row{grid-template-columns:minmax(0,1fr) 62px 62px;gap:3px;padding-left:7px;padding-right:7px}
+  .hier-medium>summary .hier-name{padding-left:9px}
+  .hier-campaign>.hier-name{padding-left:22px}
+  .panel .report{font-size:11px!important}
+  .mi-nav{gap:4px}
+  .mi-nav a{font-size:11px;padding:6px 7px;gap:4px}
+}
+@media(max-width:370px){
+  .kpis{grid-template-columns:1fr}
+  .overview-bottom{grid-template-columns:1fr}
+  .kpis.four,.kpis.five{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
+"""
+st.markdown('<style>'+CSS_V3+'</style>',unsafe_allow_html=True)
+
+
+def nav_html():
+    ico=['grid','chart','mail','wa','chat','users','trophy']
+    return '<div class="mi-top"><nav class="mi-nav">'+''.join(
+        f'<a href="#section-{i}">{icon(k,GREEN,17)}{esc(n)}</a>'
+        for i,(n,k) in enumerate(zip(PAGES,ico),1))+'</nav></div>'
+
+
+# Header/navigation polish only. All 7 report sections and calculations stay unchanged.
+CSS_FILTER_TOOLBAR = """
+/* One deliberate desktop row of filters, consistent native widget heights. */
+.mi-nav{gap:6px!important;padding:4px 0 2px!important}
+.mi-nav a{min-height:36px;display:inline-flex;align-items:center;padding:8px 11px!important;
+ font-size:12px!important;white-space:nowrap}
+[data-testid="stVerticalBlockBorderWrapper"]{
+  background:#fff!important;border:1px solid #dce5d8!important;
+  border-radius:10px!important;box-shadow:0 1px 3px rgba(22,53,38,.045)!important;
+}
+[data-testid="stVerticalBlockBorderWrapper"] > div{padding-top:2px!important;padding-bottom:2px!important}
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stWidgetLabel"] p{
+  font-size:11px!important;font-weight:700!important;letter-spacing:0!important;
+  white-space:nowrap;color:#35513f!important;
+}
+[data-testid="stVerticalBlockBorderWrapper"] [data-baseweb="select"] > div,
+[data-testid="stVerticalBlockBorderWrapper"] [data-baseweb="input"],
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stDateInput"] input{
+  min-height:38px!important;border-radius:7px!important;font-size:12px!important;
+}
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stColumn"]{min-width:0!important}
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stColumn"] input{
+  min-width:0!important;font-size:12px!important;
+}
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stDateInput"] input{
+  letter-spacing:-.2px!important;padding-left:8px!important;
+}
+[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stSelectbox"] [data-baseweb="select"] span{
+  font-size:12px!important;
+}
+/* Navigation buttons remain a separate, lightweight utility row. */
+[data-testid="stButton"] button[kind="secondary"]{height:36px!important;min-height:36px!important}
+@media(max-width:1250px){
+ .mi-nav a{padding:7px 8px!important;font-size:11px!important}
+ [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stWidgetLabel"] p{font-size:10px!important}
+}
+/* A single row remains on wide desktops; smaller screens wrap as a clean grid. */
+@media(max-width:1180px){
+ [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stHorizontalBlock"]{
+   flex-wrap:wrap!important;align-items:flex-end!important;gap:10px!important;
+ }
+ [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]{
+   flex:1 1 calc(25% - 10px)!important;width:calc(25% - 10px)!important;
+   min-width:185px!important;
+ }
+}
+@media(max-width:800px){
+ [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]{
+   flex:1 1 calc(50% - 10px)!important;width:calc(50% - 10px)!important;
+   min-width:145px!important;
+ }
+ [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stWidgetLabel"] p{font-size:12px!important}
+}
+@media(max-width:420px){
+ [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]{
+   flex:1 1 100%!important;width:100%!important;min-width:0!important;
+ }
+}
+"""
+st.markdown('<style>'+CSS_FILTER_TOOLBAR+'</style>', unsafe_allow_html=True)
+
+
+def navigation():
+    st.markdown(brand_html(), unsafe_allow_html=True)
+
+    # Navigation + refresh form one slim, consistently aligned row.
+    nav_col, refresh_col = st.columns([8.6, 1.4], gap='small', vertical_alignment='center')
+    nav_col.markdown(nav_html(), unsafe_allow_html=True)
+    if refresh_col.button('↻ Refresh', key='refresh_all', use_container_width=True):
+        load.clear()
+
+    # Medium choices come from live data; unknown values remain selectable.
+    try:
+        t0 = load()['transactions']
+        media = sorted(v for v in t0.Medium.dropna().unique() if str(v).strip())
+    except Exception:
+        media = ['Automation', 'Bulk Campaign', 'Not specified']
+
+    # One horizontal filter bar: no disconnected second row or side note.
+    with st.container(border=True):
+        batch_col, type_col, source_col, medium_col, from_col, to_col, order_col, search_col = st.columns(
+            [0.82, 0.94, 1.05, 1.12, 1.02, 1.02, 1.25, 1.75],
+            gap='small', vertical_alignment='bottom'
+        )
+        batch = batch_col.selectbox('Batch', B, index=1, key='global_batch')
+        kind = type_col.selectbox('Campaign type', ['Automation', 'Bulk'], key='global_kind')
+        source = source_col.selectbox('Source', ['All sources', 'Emailer', 'WhatsApp'], key='tx_source')
+        medium = medium_col.selectbox('Medium', ['All mediums'] + media, key='tx_medium')
+        start = from_col.date_input('From date', value=None, key='global_start', format='DD/MM/YYYY')
+        end = to_col.date_input('To date', value=None, key='global_end', format='DD/MM/YYYY')
+        voucher_order = order_col.selectbox(
+            'Voucher ranking', ['Highest to lowest', 'Lowest to highest'], key='voucher_order'
+        )
+        query = search_col.text_input(
+            'Search reports', key='global_search', placeholder='Campaign, sender or voucher…'
+        )
+    return batch, kind, source, medium, start, end, query, voucher_order
+
+
+def section(i,title,ico,left,right,details='',footer=''):
+    result=(f'<section class="section" id="section-{i}"><h2 class="sectitle">'
+            +icon(ico,GREEN,20)+esc(title)+'</h2>'
+            +'<div class="section-grid"><div class="leftstack">'+left+'</div><div class="rightstack">'+right+'</div></div>')
+    if footer:result+=div(footer,'footnote')
+    if details:result+=div(details,'section-wide')
+    return result+'</section>'
+
+
+def pair_counts(d,colname):
+    return [float(v) for v in d.groupby('Batch')[colname].sum(min_count=1).reindex(B,fill_value=0)] if not d.empty else [0,0]
+
+
+def breakdown_table(d,channel):
+    metric='Opened' if channel=='email' else 'Read'
+    metrics=EM if channel=='email' else WM
+    if d.empty:return empty('No engagement export records available.')
+    a=aggregate(d,['Batch','Type'],metrics,numer=metric)
+    if a.empty:return empty('No engagement export records available.')
+    import itertools
+    idx=pd.MultiIndex.from_product([B,['Automation','Bulk']],names=['Batch','Type'])
+    a=a.set_index(['Batch','Type']).reindex(idx).reset_index()
+    a=a[['Batch','Type','Rate','Click rate']].rename(
+        columns={'Rate':'Open rate' if channel=='email' else 'Read rate'})
+    return table(a,True)
+
+
 def overview(t,e,w,ch,same):
-    counts=t.groupby('Batch').size().reindex(B,fill_value=0);ec=t[t.Source.eq('Emailer')].groupby('Batch').size().reindex(B,fill_value=0);wc=t[t.Source.eq('WhatsApp')].groupby('Batch').size().reindex(B,fill_value=0)
-    er=pairrate(e,'Opened','Delivered');wr=pairrate(w[w.Type.eq('Automation')],'Read','Delivered');ar=pairrate(e[e.Type.eq('Automation')],'Opened','Delivered')
-    chatrate=ratio(total(ch,'Read'),total(ch,'Delivered')) if same else pairrate(ch,'Read','Delivered')
-    left=cards([kpi('Marketing transactions',counts.tolist(),'layers','primary'),kpi('Emailer transactions',ec.tolist(),'mail'),kpi('WhatsApp transactions',wc.tolist(),'wa'),kpi('Email overall open rate',er,'mail',percent=True),kpi('WhatsApp automation read rate',wr,'wa',percent=True),kpi('Converse Chat read rate',chatrate,'chat','accent',True,'Shared summary')])
-    right=insight([('Transaction volume',f'{fmt(counts.iloc[0])} LY · {fmt(counts.iloc[1])} CY.'),('Leading channel',f'Emailer accounts for {pct(ratio(ec.iloc[0],counts.iloc[0]))} of LY marketing transactions.'),('Email automation',f'{pct(ar[0])} LY → {pct(ar[1])} CY ({change(*ar)}).'),('WhatsApp automation',f'{pct(wr[0])} LY → {pct(wr[1])} CY ({change(*wr)}).')],foot='Full available cycle exports cover unequal periods; not a matched-period YoY comparison.')
-    return section(1,'Executive Overview','grid',left,right,overview=True)
+    counts=pair_counts(t.assign(_n=1),'_n');em=pair_counts(t[t.Source.eq('Emailer')].assign(_n=1),'_n');wa_count=pair_counts(t[t.Source.eq('WhatsApp')].assign(_n=1),'_n')
+    er=pairrate(e,'Opened','Delivered'); ecr=pairrate(e,'Clicked','Delivered')
+    wr=pairrate(w,'Read','Delivered'); wcr=pairrate(w,'Clicked','Delivered')
+    cc=total(ch,'Triggered')
+    row1=cards([kpi('Combined (Emailer + WhatsApp) Transactions',counts,'layers','primary'),kpi('Emailer Transactions',em,'mail'),kpi('WhatsApp Transactions',wa_count,'wa')])
+    row2=cards([kpi('Email Overall Open Rate',er,'mail',percent=True),kpi('Email Overall Click Rate',ecr,'chart',percent=True),kpi('WhatsApp Overall Read Rate',wr,'wa',percent=True),kpi('WhatsApp Overall Click Rate',wcr,'chart','accent',True)],'four')
+    chat=kpi('Total Converse Chats',cc,'chat','primary',sub='Triggered messages · not unique conversations')
+    bottom=div(chat+panel('Email · Automation vs Bulk',breakdown_table(e,'email'),'mail')+panel('WhatsApp · Automation vs Bulk',breakdown_table(w,'wa'),'wa'),'overview-bottom')
+    left=row1+row2+bottom
+    anu=pairrate(e[e.Type.eq('Automation')],'Opened','Delivered');wau=pairrate(w[w.Type.eq('Automation')],'Read','Delivered')
+    items=[('Total marketing transactions',f'{fmt(counts[0])} LY · {fmt(counts[1])} CY.'),
+           ('Email engagement',f'Open {pct(er[0])} LY → {pct(er[1])} CY; click {pct(ecr[0])} → {pct(ecr[1])}.'),
+           ('WhatsApp engagement',f'Read {pct(wr[0])} LY → {pct(wr[1])} CY; click {pct(wcr[0])} → {pct(wcr[1])}.'),
+           ('Automation comparison',f'Email opens {pct(anu[0])} → {pct(anu[1])}; WhatsApp reads {pct(wau[0])} → {pct(wau[1])}.'),
+           ('Converse Chat',f'{fmt(cc)} triggered messages. Unique conversations cannot be inferred.'),
+           ('Comparison scope','Full export periods differ across batches; not matched-period YoY.')]
+    return section(1,'Executive Overview','grid',left,insight(items))
 
-def transaction_section(t,start,end,query):
-    invalid=start and end and start>end
+
+def nested_transaction_table(t):
+    """A single Source → Medium → Campaign drill-down table; counts by row, not invented mediums."""
+    if t.empty:return empty('No transactions match these filters.')
+    total_by_batch=t.groupby('Batch').size().reindex(B,fill_value=0)
+    html_=['<div class="hier" role="region" aria-label="Expandable transaction breakdown">',
+           '<div class="hier-header"><span>Source / Medium / Campaign</span><span class="hnum">2026–28</span><span class="hnum">2027–29</span></div>']
+    def nums(df):
+        z=df.groupby('Batch').size().reindex(B,fill_value=0)
+        return '<span class="hnum">'+fmt(z[B[0]])+'</span><span class="hnum">'+fmt(z[B[1]])+'</span>'
+    for src,sd in t.groupby('Source',sort=True):
+        html_.append('<details class="hier-source"><summary class="hier-row"><span class="hier-name">'+esc(src)+'</span>'+nums(sd)+'</summary>')
+        for med,md in sd.groupby('Medium',sort=True):
+            html_.append('<details class="hier-medium"><summary class="hier-row"><span class="hier-name">'+esc(med)+'</span>'+nums(md)+'</summary>')
+            for camp,cd in md.groupby('Campaign',sort=True):
+                html_.append('<div class="hier-row hier-campaign"><span class="hier-name">'+esc(camp)+'</span>'+nums(cd)+'</div>')
+            html_.append('</details>')
+        html_.append('</details>')
+    html_.append('<div class="hier-row hier-footer"><span>Total</span><span class="hnum">'+fmt(total_by_batch[B[0]])+'</span><span class="hnum">'+fmt(total_by_batch[B[1]])+'</span></div></div>')
+    return ''.join(html_)
+
+
+def transaction_section(t, batch, source, medium, start, end, query):
+    invalid=bool(start and end and start>end)
     if invalid:start=end=None
-    if start:t=t[t.Date>=pd.Timestamp(start)]
-    if end:t=t[t.Date<pd.Timestamp(end)+pd.Timedelta(days=1)]
-    m=monthly(t).groupby(['Batch','Month']).size().reset_index(name='Transactions'); source=t.groupby(['Batch','Source']).size().reindex(pd.MultiIndex.from_product([B,['Emailer','WhatsApp']],names=['Batch','Source']),fill_value=0).reset_index(name='Transactions')
-    charts=split(panel('Monthly transaction trend',svg_chart(m,'Month','Transactions',kind='line',width=390,height=193),'chart',extra='panel-fill'),panel('Channel share · LY',donut(t[t.Batch.eq(B[0])].groupby('Source').size().reset_index(name='Transactions')),'pie',extra='panel-fill'),panel('Source comparison',svg_chart(source,'Source','Transactions',width=300,height=185),'chart',extra='panel-fill'),cls='txcharts')
-    summary=count_table(t,['Source','Medium']);summary=pd.concat([summary,pd.DataFrame([{'Source':'Total','Medium':'',**{b:int(summary[b].sum()) for b in B}}])],ignore_index=True)
-    ly=t[t.Batch.eq(B[0])];cy=t[t.Batch.eq(B[1])];peak=m.sort_values('Transactions',ascending=False);unknown=int(t.Medium.eq('Not specified').sum());z=t[t.Campaign.str.contains(query,case=False,regex=False)] if query else t
-    before=(note('Start date is after end date. Showing the full available transaction period.') if invalid else '')+charts
-    left=panel('Transactions by source and medium',table(summary,True),'table')
-    right=insight([('Total transactions',f'{len(ly):,} LY · {len(cy):,} CY (selected dates).'),('Leading channel',f'Emailer · {pct(ratio(ly.Source.eq("Emailer").sum(),len(ly)))} of LY transactions.'),('Peak month',f'{monthlabel(peak.iloc[0].Month)} · {peak.iloc[0].Batch} · {fmt(peak.iloc[0].Transactions)} transactions.' if len(peak) else 'No records.'),('Attribution coverage',f'{pct(ratio(len(t)-unknown,len(t)))} specified · {unknown:,} of {len(t):,} missing medium.')],foot='Exact source matching. Blank medium is not inferred.')
-    details=detail('Complete campaign-wise transaction breakdown',count_table(z,['Source','Medium','Campaign']))+detail('Month-wise transaction detail',count_table(monthly(t),['Month','Source','Medium']))
-    return section(2,'Transaction Performance','chart',left,right,details,before=before)
+    tt=t.copy()
+    if start:tt=tt[tt.Date>=pd.Timestamp(start)]
+    if end:tt=tt[tt.Date<pd.Timestamp(end)+pd.Timedelta(days=1)]
+    if source!='All sources':tt=tt[tt.Source.eq(source)]
+    if medium!='All mediums':tt=tt[tt.Medium.eq(medium)]
+    monthly_source=monthly(tt[tt.Batch.eq(batch)]).groupby(['Month','Source']).size().reset_index(name='Transactions')
+    # Always plot both channel lines on the same months; a confirmed absent channel is zero.
+    if len(monthly_source):
+        ix=pd.MultiIndex.from_product([sorted(monthly_source.Month.unique()),['Emailer','WhatsApp']],names=['Month','Source'])
+        monthly_source=monthly_source.set_index(['Month','Source']).reindex(ix,fill_value=0).reset_index()
+    ly=tt[tt.Batch.eq(B[0])];cy=tt[tt.Batch.eq(B[1])]
+    pie=tt[tt.Batch.eq(batch)].groupby('Source').size().reset_index(name='Transactions')
+    source_comparison=tt.groupby(['Batch','Source']).size().reset_index(name='Transactions')
+    chart1=panel('Monthly Transactions · Emailer vs WhatsApp',svg_chart(monthly_source,'Month','Transactions',group='Source',kind='line',width=640,height=215), 'chart',sub=f'{batch} · Transaction Date · source-level trends',extra='panel-fill')
+    chart2=panel('Channel Contribution',donut(pie),'pie',sub=f'{batch} · selected date/source/medium scope',extra='panel-fill')
+    charts=div(chart1+chart2,'tx-top')
+    chart3=panel('Emailer vs WhatsApp · LY and CY',svg_chart(source_comparison,'Source','Transactions',group='Batch',kind='bar',width=600,height=195),'chart')
+    m=monthly(tt).groupby(['Batch','Month','Source']).size().reset_index(name='Transactions')
+    md=m.pivot_table(index=['Month','Source'],columns='Batch',values='Transactions',aggfunc='sum',fill_value=0).reindex(columns=B,fill_value=0).reset_index() if not m.empty else pd.DataFrame(columns=['Month','Source']+B)
+    details=panel('Month-wise Transaction Detail',table(md),'calendar',extra='month-table')
+    search_t=tt[tt.Campaign.str.contains(query,case=False,regex=False)] if query else tt
+    left=charts+panel('Transaction Attribution · Source → Medium → Campaign',nested_transaction_table(search_t),'table',sub='Click the arrow beside a source, then a medium to view its campaigns')
+    lead=tt.Source.value_counts();leading=lead.index[0] if len(lead) else 'Unavailable'
+    peak=m.sort_values('Transactions',ascending=False) if len(m) else m
+    unknown=int(tt.Medium.eq('Not specified').sum())
+    coverage=ratio(len(tt)-unknown,len(tt))
+    right=insight([('Total transactions',f'{fmt(len(ly))} LY · {fmt(len(cy))} CY.'),
+                   ('Most attributed channel',f'{leading} · {fmt(lead.iloc[0])} transactions.' if len(lead) else 'No data.'),
+                   ('Peak month',f'{monthlabel(peak.iloc[0].Month)} · {peak.iloc[0].Source} · {fmt(peak.iloc[0].Transactions)}.' if len(peak) else 'No data.'),
+                   ('Medium completeness',f'{pct(coverage)} specified · {fmt(unknown)} not specified.'),
+                   ('Source hierarchy','Click Source → Medium → Campaign to expand in the same table.')],
+                  foot='Exact marketing source classification; date range and source/medium selections apply to this section.')
+    return section(2,'Transaction Performance','chart',left,right,details=div(chart3+details,'tx-bottom'),footer=note('Start date exceeds end date; showing all dates.') if invalid else '')
 
-# Same layout for both channels, with complete comparison tables and dynamic right rail.
-def channel_section(d,is_email,batch,kind,query):
-    page='Email' if is_email else 'WhatsApp';idx=3 if is_email else 4;n='Opened' if is_email else 'Read';kr='open rate' if is_email else 'read rate';metrics=EM if is_email else WM;ico='mail' if is_email else 'wa'
-    agg=aggregate(d,['Batch','Type'],metrics,numer=n);selected=d[d.Batch.eq(batch)&d.Type.eq(kind)];z=selected
-    if query:z=z[z.Campaign.str.contains(query,case=False,regex=False)|(z.Subject.str.contains(query,case=False,regex=False) if is_email else False)]
-    cols=['Delivered','Opened','Rate','Clicked','Click rate'] if is_email else ['Triggered','Delivered','Read','Rate']
-    panels=[]
-    for k in ['Automation','Bulk']:
-        missing=set(B)-set(d[d.Type.eq(k)].Batch)
-        # Keep both table panels aligned. Missing data is already visible as em dashes.
-        panels.append(panel(page+' '+k,table(compare_table(agg,k,cols),True)+ (note('Unavailable: '+', '.join(sorted(missing))) if missing else ''),ico))
-    before=''
-    if not is_email:before+=cards([kpi('Triggered',total(selected,'Triggered'),'send','primary',sub=batch+' · '+kind),kpi('Delivered',total(selected,'Delivered'),'check',sub=batch+' · '+kind),kpi('Read',total(selected,'Read'),'chat',sub=batch+' · '+kind),kpi('Read rate',ratio(total(selected,'Read'),total(selected,'Delivered')),'pie','accent',True,batch+' · '+kind)],'four')
-    before+=split(*panels)
-    keys=['Campaign','Subject'] if is_email else ['Campaign'];r=ranked(z,keys,metrics,numer=n);short=r.head(5).copy()
-    name='Campaign / Subject' if is_email else 'Campaign / Template'
-    if is_email:short[name]=list(zip(short.Subject,short.Campaign))
-    else:short[name]=[tuple(reversed(v.rsplit(' / ',1))) if ' / ' in v else (v,'') for v in short.Campaign]
-    short=short[['Rank',name,'Delivered',n,'Rate']].rename(columns={'Rate':kr.capitalize()})
-    m=aggregate(monthly(selected),['Month'],metrics,numer=n);trend=aggregate(monthly(d[d.Type.eq(kind)]),['Batch','Month'],metrics,numer=n)
-    volume=svg_chart(m.melt(id_vars='Month',value_vars=['Delivered',n],var_name='Metric',value_name='Volume'),'Month','Volume','Metric',width=570,height=200)
-    trendplot=svg_chart(trend,'Month','Rate',kind='line',width=570,height=200)
-    left=panel('Top 5 campaigns by '+kr,table(short),'trophy',batch+' · '+kind)
-    after=split(panel('Monthly delivered & '+n.lower(),volume,'chart',batch+' · '+kind,extra='panel-fill'),panel('Monthly '+kr+' trend',trendplot,'chart',kind+' · both batches',extra='panel-fill'))
-    au=pairrate(d[d.Type.eq('Automation')],n,'Delivered');bu=pairrate(d[d.Type.eq('Bulk')],n,'Delivered');v=ratio(total(selected,n),total(selected,'Delivered'))
-    items=[('Automation '+kr,f'{pct(au[0])} LY → {pct(au[1])} CY ({change(*au)}).'),('Bulk '+kr,f'{pct(bu[0])} LY → {pct(bu[1])} CY ({change(*bu)}).'),('Selected campaign type',f'{batch} · {kind}: {fmt(total(selected,"Delivered"))} delivered, {fmt(total(selected,n))} {n.lower()}; {pct(v)}.'),('Top ranked result',f'{pct(r.iloc[0].Rate)} from {fmt(r.iloc[0].Delivered)} deliveries. Low-volume campaigns can have high rates.' if not r.empty else 'No eligible campaign for this selection.')]
-    if is_email:items.append(('Click engagement',f'{pct(ratio(total(selected,"Clicked"),total(selected,"Delivered")))} of deliveries clicked.'))
-    elif B[1] not in set(d[d.Type.eq('Bulk')].Batch):items.append(('Data availability','Current-batch WhatsApp Bulk export is unavailable, not zero.'))
-    right=insight(items,foot='Automation opens/clicks estimated from exported rates × delivered; Bulk uses counts.' if is_email else 'Delivered = Delivered-only + Read + Clicked. Read rate = Read ÷ Delivered.')
-    details=detail('Complete campaign rankings · '+batch+' · '+kind,r)+detail('Monthly engagement detail · '+kind,trend)
-    return section(idx,page+' Campaign Performance',ico,left,right,details,before=before,after=after)
+
+def ranked_all(d, metric):
+    """All campaigns, weighted sums by campaign/subject; independent open/read vs click rankings."""
+    if d.empty:
+        return pd.DataFrame(columns=['Rank','Campaign / Subject','Delivered',metric,'Rate'])
+    group=['Campaign','Subject'] if 'Subject' in d else ['Campaign']
+    metric_fields=['Delivered',metric] if metric=='Clicked' else ['Delivered',metric,'Clicked']
+    a=d.groupby(group,dropna=False)[metric_fields].sum(min_count=1).reset_index()
+    a=a[a.Delivered.gt(0)].copy()
+    a['Rate']=rate(a[metric],a.Delivered)
+    a=a.dropna(subset=['Rate']).sort_values(['Rate','Delivered','Campaign'],ascending=[False,False,True],kind='stable').reset_index(drop=True)
+    a.insert(0,'Rank',range(1,len(a)+1))
+    if 'Subject' in a:
+        a['Campaign / Subject']=[(sub,camp) for camp,sub in zip(a.Campaign,a.Subject)]
+    else:
+        a['Campaign / Subject']=[(val.rsplit(' / ',1)[-1],val.rsplit(' / ',1)[0]) if ' / ' in val else (val,'') for val in a.Campaign]
+    return a[['Rank','Campaign / Subject','Delivered',metric,'Rate']].rename(columns={'Rate':('Click rate' if metric=='Clicked' else 'Open rate' if metric=='Opened' else 'Read rate')})
+
+
+def channel_section(d, is_email, batch, kind, query):
+    channel='Email' if is_email else 'WhatsApp';index=3 if is_email else 4
+    metric='Opened' if is_email else 'Read'; ico='mail' if is_email else 'wa'; m=EM if is_email else WM
+    summary=aggregate(d,['Batch','Type'],m,numer=metric)
+    # Retain unavailable batches as blank, not zero.
+    def compact_type(typ):
+        z=summary[summary.Type.eq(typ)].set_index('Batch').reindex(B).rename_axis('Batch').reset_index()
+        fields=['Batch','Delivered',metric,'Rate','Clicked','Click rate']
+        if not is_email:fields.insert(1,'Triggered')
+        return table(z[fields].rename(columns={'Rate':'Open rate' if is_email else 'Read rate'}),True)
+    header=div(panel(channel+' Automation',compact_type('Automation'),ico)+panel(channel+' Bulk',compact_type('Bulk'),ico),'reports-row')
+    selected=d[d.Batch.eq(batch)&d.Type.eq(kind)]
+    if query:
+        mask=selected.Campaign.str.contains(query,case=False,regex=False)
+        if is_email:mask=mask|selected.Subject.str.contains(query,case=False,regex=False)
+        selected=selected[mask]
+    # Four full rankings per channel: Automation Open/Read + Click, Bulk Open/Read + Click.
+    rank_html=[]; ranks={}
+    for typ in ['Automation','Bulk']:
+        current=d[d.Batch.eq(batch)&d.Type.eq(typ)]
+        if query:
+            mask=current.Campaign.str.contains(query,case=False,regex=False)
+            if is_email:mask=mask|current.Subject.str.contains(query,case=False,regex=False)
+            current=current[mask]
+        open_rank=ranked_all(current,metric)
+        click_rank=ranked_all(current,'Clicked')
+        ranks[typ]=(open_rank,click_rank)
+        head=div(esc(typ+' · Full Campaign Rankings  |  '+batch+' · '+fmt(len(open_rank))+' campaigns'),'subhead')
+        rank_html.append(head+div(
+            panel('All campaigns · '+('Open Rate' if is_email else 'Read Rate'),table(open_rank),'trophy',sub='All campaigns · sorted by delivered-based rate (small bases can rank first)')+
+            panel('All campaigns · Click Rate',table(click_rank),'trophy',sub='All campaigns · sorted by delivered-based rate (small bases can rank first)'), 'rank-pair'))
+    volume=aggregate(monthly(d[d.Batch.eq(batch)&d.Type.eq(kind)]),['Month'],m,numer=metric)
+    trend=aggregate(monthly(d[d.Type.eq(kind)]),['Batch','Month'],m,numer=metric)
+    if not volume.empty:
+        melted=volume.melt(id_vars='Month',value_vars=['Delivered',metric],var_name='Metric',value_name='Volume')
+        vplot=svg_chart(melted,'Month','Volume',group='Metric',kind='bar',width=500,height=210)
+    else:vplot=empty('No monthly volume data for this batch and campaign type.')
+    tr=svg_chart(trend,'Month','Rate',kind='line',width=500,height=210)
+    charts=div(panel('Monthly Delivered & '+metric,vplot,'chart',sub=f'{batch} · {kind}')+
+               panel('Monthly '+('Open Rate' if is_email else 'Read Rate')+' · LY vs CY',tr,'chart',sub=kind+' · full-cycle months'),'reports-row')
+    left=header+charts
+    overall=pairrate(d,metric,'Delivered'); clicks=pairrate(d,'Clicked','Delivered')
+    a=pairrate(d[d.Type.eq('Automation')],metric,'Delivered');b=pairrate(d[d.Type.eq('Bulk')],metric,'Delivered')
+    toplist=ranks[kind][0]
+    top=toplist.iloc[0] if not toplist.empty else None
+    items=[('Overall '+('open' if is_email else 'read')+' rate',f'{pct(overall[0])} LY → {pct(overall[1])} CY ({change(*overall)}).'),
+           ('Overall click rate',f'{pct(clicks[0])} LY → {pct(clicks[1])} CY ({change(*clicks)}).'),
+           ('Automation '+('open' if is_email else 'read')+' rate',f'{pct(a[0])} LY → {pct(a[1])} CY.'),
+           ('Bulk '+('open' if is_email else 'read')+' rate',f'{pct(b[0])} LY → {pct(b[1])} CY.'),
+           ('Selected batch/type',f'{batch} · {kind}: {fmt(total(selected,"Delivered"))} delivered, {fmt(total(selected,metric))} '+metric.lower()+'; '+pct(ratio(total(selected,metric),total(selected,'Delivered')))+'.'),
+           ('Highest '+('open' if is_email else 'read')+' rate',f'{top["Campaign / Subject"][0]} · {pct(top["Open rate" if is_email else "Read rate"])} on {fmt(top.Delivered)} deliveries.' if top is not None else 'Unavailable.')]
+    if not is_email and not len(d[d.Batch.eq(B[1])&d.Type.eq('Bulk')]):items.append(('Bulk data coverage','CY WhatsApp Bulk export unavailable; reported as —, not 0.'))
+    foot='Automation opens/clicks are estimated as delivered × exported %; Bulk uses counts.' if is_email else 'Read and Click rates use Delivered denominator; missing exports are unavailable.'
+    return section(index,channel+' Campaign Performance',ico,left,insight(items,foot=foot),details=''.join(rank_html))
+
 
 def converse(ch,same,batch):
-    if not same:ch=ch[ch.Batch.eq(batch)]
-    label='Shared summary' if same else batch;delivered=total(ch,'Delivered');read=total(ch,'Read');rr=ratio(read,delivered)
-    m=aggregate(monthly(ch),['Month'],WM,numer='Read');overall=aggregate(ch.assign(Month='Overall'),['Month'],WM,numer='Read')
-    k=cards([kpi('Delivered',delivered,'send','primary',sub=label),kpi('Read',read,'chat',sub=label),kpi('Overall read rate',rr,'pie','accent',True,label)])
-    data=pd.concat([m,overall],ignore_index=True)[['Month','Delivered','Read','Rate']].rename(columns={'Rate':'Read rate'})
-    plot=svg_chart(m.melt(id_vars='Month',value_vars=['Delivered','Read'],var_name='Metric',value_name='Volume'),'Month','Volume','Metric',width=475,height=158,secondary=dict(zip(m.Month,m.Rate)))
-    left=split(panel('Month-wise Converse Chat',table(data,True),'calendar'),panel('Delivered vs read',plot,'chart',extra='panel-fill'),cls='split converse-pair')
-    before=k
-    after=''
-    valid=m.dropna(subset=['Rate']);best=valid.loc[valid.Rate.idxmax()] if len(valid) else None;worst=valid.loc[valid.Rate.idxmin()] if len(valid) else None
-    right=insight([('Overall engagement',f'{fmt(read)} reads from {fmt(delivered)} delivered · {pct(rr)}.'),('Best month',f'{monthlabel(best.Month)} · {pct(best.Rate)}.' if best is not None else 'Unavailable.'),('Lowest month',f'{monthlabel(worst.Month)} · {pct(worst.Rate)}.' if worst is not None else 'Unavailable.'),('First to latest month',change(valid.iloc[0].Rate,valid.iloc[-1].Rate) if len(valid)>1 else 'At least two months required.')],'Key Observations',foot='Identical batch summaries shown once; read rate = Read ÷ successfully delivered.' if same else 'Selected batch summary; read rate = Read ÷ successfully delivered.')
-    return section(5,'Converse Chat Performance','chat',left,right,before=before,after=after)
+    x=ch if same else ch[ch.Batch.eq(batch)]
+    delivered=total(x,'Delivered');read=total(x,'Read');triggered=total(x,'Triggered')
+    m=aggregate(monthly(x),['Month'],WM,numer='Read')
+    overall=aggregate(x.assign(Month='Overall'),['Month'],WM,numer='Read')
+    k=cards([kpi('Triggered chat messages',triggered,'send','primary',sub='Not unique conversations'),
+             kpi('Delivered',delivered,'check',sub='Available export'),
+             kpi('Read',read,'chat',sub='Available export'),
+             kpi('Read rate',ratio(read,delivered),'pie','accent',True,sub='Read ÷ Delivered')],'four')
+    data=pd.concat([m,overall],ignore_index=True)[['Month','Triggered','Delivered','Read','Rate']].rename(columns={'Rate':'Read rate'}) if len(m) else pd.DataFrame(columns=['Month','Triggered','Delivered','Read','Read rate'])
+    melted=m.melt(id_vars='Month',value_vars=['Delivered','Read'],var_name='Metric',value_name='Volume') if len(m) else pd.DataFrame(columns=['Month','Metric','Volume'])
+    curve=svg_chart(melted,'Month','Volume','Metric',kind='bar',width=540,height=210,secondary=dict(zip(m.Month,m.Rate)) if len(m) else None)
+    main=div(panel('Month-wise Converse Chat',table(data),'calendar')+panel('Delivered vs Read · Monthly',curve,'chart'),'reports-row')
+    valid=m.dropna(subset=['Rate'])
+    best=valid.loc[valid.Rate.idxmax()] if len(valid) else None
+    worst=valid.loc[valid.Rate.idxmin()] if len(valid) else None
+    right=insight([('Triggered volume',f'{fmt(triggered)} messages triggered in this report.'),
+                   ('Read performance',f'{fmt(read)} read / {fmt(delivered)} delivered · {pct(ratio(read,delivered))}.'),
+                   ('Best month',f'{monthlabel(best.Month)} · {pct(best.Rate)}.' if best is not None else 'Unavailable.'),
+                   ('Lowest month',f'{monthlabel(worst.Month)} · {pct(worst.Rate)}.' if worst is not None else 'Unavailable.'),
+                   ('Metric definition','Triggered messages are not necessarily unique chat conversations.')],
+                  foot='Same monthly summary across batches is counted only once.')
+    return section(5,'Converse Chat Performance','chat',k+main,right)
+
 
 def sender_section(s,batch,query):
-    summary=aggregate(s,['Batch'],SM,den='Sent');selected=s[s.Batch.eq(batch)];z=selected[selected.Sender.str.contains(query,case=False,regex=False)] if query else selected;ss=total(selected,'Sent');oo=total(selected,'Opened');cc=total(selected,'Clicked')
+    summary=aggregate(s,['Batch'],SM,den='Sent')
+    selected=s[s.Batch.eq(batch)]
+    z=selected[selected.Sender.str.contains(query,case=False,regex=False)] if query else selected
+    ss=total(selected,'Sent');oo=total(selected,'Opened');cc=total(selected,'Clicked')
     k=cards([kpi('Emails sent',ss,'mail','primary',sub=batch),kpi('Opened',oo,'mail',sub=batch),kpi('Clicked',cc,'check',sub=batch),kpi('Open rate',ratio(oo,ss),'pie','accent',True,batch),kpi('Click rate',ratio(cc,ss),'chart',percent=True,sub=batch)],'five')
-    r=aggregate(z,['Sender'],SM,den='Sent').sort_values('Sent',ascending=False).reset_index(drop=True);r.insert(0,'Rank',range(1,len(r)+1));short=r.head(5).copy();short['Sender']=[(v.rsplit(' (',1)[0],v.rsplit(' (',1)[1].rstrip(')')) if ' (' in v else (v,'') for v in short.Sender]
-    left=panel('Top 5 senders by email volume',table(short[['Rank','Sender','Sent','Opened','Rate','Clicked','Click rate']].rename(columns={'Rate':'Open rate'})),'trophy',batch)
-    before=k+panel('Overall email summary · both batches',table(summary.set_index('Batch').reindex(B).reset_index()[['Batch','Sent','Opened','Clicked','Rate','Click rate']].rename(columns={'Rate':'Open rate'}),True),'table')
-    a,b=pair(s,'Sent');orates=pairrate(s,'Opened','Sent');crates=pairrate(s,'Clicked','Sent');top=r.iloc[0] if not r.empty else None
-    right=insight([('Email volume',f'{fmt(a)} LY · {fmt(b)} CY.'),('Open rate',f'{pct(orates[0])} → {pct(orates[1])} ({change(*orates)}).'),('Click rate',f'{pct(crates[0])} → {pct(crates[1])} ({change(*crates)}).'),('Top matching sender',f'{top.Sender.split(" (")[0]} · {fmt(top.Sent)} emails · {pct(ratio(top.Sent,ss))} of batch volume.' if top is not None else 'No matching sender.'),('Top five contribution',pct(ratio(total(r.head(5),'Sent'),ss))+' of batch volume.')],foot='Rates use sent emails as denominator. No reliable monthly date field in sender exports.')
-    details=detail('Complete sender ranking · '+batch,r)+detail('Sender × email type',aggregate(z,['Sender','Type'],SM,den='Sent'))
-    return section(6,'Sender-wise Email Performance','users',left,right,details,before=before)
+    r=aggregate(z,['Sender'],SM,den='Sent').sort_values('Sent',ascending=False).reset_index(drop=True)
+    r.insert(0,'Rank',range(1,len(r)+1));short=r.head(5).copy()
+    if len(short):short['Sender']=[(v.rsplit(' (',1)[0],v.rsplit(' (',1)[1].rstrip(')')) if ' (' in v else (v,'') for v in short.Sender]
+    left=k+panel('Top Senders by Email Volume',table(short[['Rank','Sender','Sent','Opened','Rate','Clicked','Click rate']].rename(columns={'Rate':'Open rate'})),'users',sub=batch)+panel('Overall Email Summary · Both Batches',table(summary.set_index('Batch').reindex(B).reset_index()[['Batch','Sent','Opened','Clicked','Rate','Click rate']].rename(columns={'Rate':'Open rate'}),True),'table')
+    a,b=pair(s,'Sent');orr=pairrate(s,'Opened','Sent');crr=pairrate(s,'Clicked','Sent')
+    top=r.iloc[0] if len(r) else None
+    right=insight([('Volume',f'{fmt(a)} LY · {fmt(b)} CY.'),('Open rate',f'{pct(orr[0])} → {pct(orr[1])} ({change(*orr)}).'),('Click rate',f'{pct(crr[0])} → {pct(crr[1])} ({change(*crr)}).'),('Top matching sender',f'{top.Sender.split(" (")[0]} · {fmt(top.Sent)} sent.' if top is not None else 'No matching sender.'),('Sender scope','Rates use Emails Sent as denominator; no monthly date column in export.')])
+    details=detail('Complete Sender Rankings · '+batch,r)+detail('Sender × Email Type',aggregate(z,['Sender','Type'],SM,den='Sent'))
+    return section(6,'Sender-wise Email Performance','users',left,right,div(details,'detail-row'))
 
-def render_report(data,batch,kind,start,end,query,checked):
-    t,e,w,ch,s=[data[k] for k in ['transactions','email','wa','chat','senders']]
-    ca=aggregate(monthly(ch),['Batch','Month'],WM,numer='Read');p=ca[ca.Batch.eq(B[0])].drop(columns='Batch').reset_index(drop=True);q=ca[ca.Batch.eq(B[1])].drop(columns='Batch').reset_index(drop=True);same=p.equals(q) and not p.empty;cv=ch[ch.Batch.eq(B[1])] if same else ch
-    status='<div class="statusline"><span><b>● Google Sheets connected</b> · '+esc(checked)+'</span><span>Refresh: 60 seconds · '+esc(batch)+' selected · '+esc(kind)+'</span></div>'
-    return '<div class="mi-top">'+status+'</div><div class="mi">'+overview(t,e,w,cv,same)+transaction_section(t,start,end,query)+channel_section(e,True,batch,kind,query)+channel_section(w,False,batch,kind,query)+converse(cv,same,batch)+sender_section(s,batch,query)+'<div class="footer">Read-only Google Sheets connection · Full available export periods · — = unavailable, not zero · No Excel runtime connection</div></div>'
+
+def voucher_section(v,order,query):
+    if query:v=v[v.Voucher.str.contains(query,case=False,regex=False)]
+    if v.empty:
+        data=pd.DataFrame(columns=['Student Voucher Code']+B+['Total Paid Applications'])
+    else:
+        data=v.groupby(['Voucher','Batch'])['Application ID'].nunique().unstack(fill_value=0).reindex(columns=B,fill_value=0)
+        data['Total Paid Applications']=data.sum(axis=1)
+        data=data.reset_index().rename(columns={'Voucher':'Student Voucher Code'})
+        data=data.sort_values(['Total Paid Applications','Student Voucher Code'],ascending=[order=='Lowest to highest',True],kind='stable').reset_index(drop=True)
+        data.insert(0,'Rank',range(1,len(data)+1))
+    unique_ly=v[v.Batch.eq(B[0])]['Application ID'].nunique() if len(v) else 0
+    unique_cy=v[v.Batch.eq(B[1])]['Application ID'].nunique() if len(v) else 0
+    best=data.sort_values('Total Paid Applications',ascending=False).iloc[0] if len(data) else None
+    suspicious=int(v.Voucher.astype(str).str.fullmatch(r'\d{5}(?:\.0)?').sum()) if len(v) else 0
+    cards1=cards([kpi('Paid Voucher Applications',[unique_ly,unique_cy],'layers','primary'),
+                  kpi('Voucher Codes Used',v.Voucher.nunique() if len(v) else 0,'trophy',sub='Across available batches'),
+                  kpi('Top Voucher · Paid Applications',best['Total Paid Applications'] if best is not None else float('nan'),'check',sub=best['Student Voucher Code'] if best is not None else 'Unavailable')])
+    left=cards1+panel('Voucher-wise Paid Application Rankings',table(data),'table',sub='Unique Application ID · Payment Status = Paid · sortable highest/lowest via top filter',extra='voucher-rank')
+    right=insight([('Paid applications with vouchers',f'{fmt(unique_ly)} LY · {fmt(unique_cy)} CY.'),
+                   ('Distinct codes',f'{fmt(v.Voucher.nunique())} codes in the filtered scope.'),
+                   ('Highest-converting code',f'{best["Student Voucher Code"]} · {fmt(best["Total Paid Applications"])} paid applications.' if best is not None else 'No records.'),
+                   ('Sort direction',order),
+                   ('Counting rule','Unique Application ID per Batch + Voucher with Payment Status Paid and valid Transaction Date.'),
+                   ('Voucher data quality',f'{fmt(suspicious)} paid records have numeric date-like voucher values; check source cell formatting.' if suspicious else 'No numeric date-like voucher codes detected.')],
+                  foot='Voucher code primary field, fallback to secondary. All sources included, no duplicate paid applications.')
+    return section(7,'Student Voucher Code Performance','trophy',left,right)
+
+
+def render_report(data,batch,kind,source,medium,start,end,query,voucher_order,checked):
+    t,e,w,ch,s,v=[data[k] for k in ['transactions','email','wa','chat','senders','voucher']]
+    ca=aggregate(monthly(ch),['Batch','Month'],WM,numer='Read')
+    p=ca[ca.Batch.eq(B[0])].drop(columns='Batch').reset_index(drop=True)
+    q=ca[ca.Batch.eq(B[1])].drop(columns='Batch').reset_index(drop=True)
+    same=p.equals(q) and not p.empty
+    cv=ch[ch.Batch.eq(B[1])] if same else ch[ch.Batch.eq(batch)]
+    status='<div class="statusline"><span><b>● Google Sheets connected</b> · '+esc(checked)+'</span><span>Auto-refresh 60s · '+esc(batch)+' · '+esc(kind)+'</span></div>'
+    parts=[overview(t,e,w,cv,same),transaction_section(t,batch,source,medium,start,end,query),
+           channel_section(e,True,batch,kind,query),channel_section(w,False,batch,kind,query),
+           converse(cv,same,batch),sender_section(s,batch,query),voucher_section(v,voucher_order,query)]
+    return '<div class="mi-top">'+status+'</div><div class="mi">'+''.join(parts)+ '<div class="footer">Source: Google Sheets only · Automatic refresh every 60s while open · Full-cycle LY/CY comparisons are not matched reporting periods · — = unavailable, not zero</div></div>'
 
 @st.fragment(run_every='60s')
-def dashboard(batch,kind,start,end,query):
+def dashboard(batch,kind,source,medium,start,end,query,voucher_order):
     try:
-        with st.spinner('Reading Google Sheets…'):data=load()
+        with st.spinner('Reading Google Sheets…'):
+            data=load()
     except Exception as exc:
-        st.error('Google Sheets connection or schema error. Please contact the dashboard administrator.');return
+        st.error('Google Sheets connection or schema error. Review worksheet names and permissions.');return
     checked=datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%d %b %Y, %I:%M:%S %p IST')
-    # One report markup tree: browser grid controls all section alignment.
-    st.markdown(render_report(data,batch,kind,start,end,query,checked),unsafe_allow_html=True)
+    st.markdown(render_report(data,batch,kind,source,medium,start,end,query,voucher_order,checked),unsafe_allow_html=True)
 
 filters=navigation()
 dashboard(*filters)
