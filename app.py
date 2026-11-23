@@ -162,6 +162,56 @@ def senders(rows,batch):
 
 
 
+
+def _norm_head(v):
+    return re.sub(r'[^a-z0-9]', '', str(v).strip().casefold())
+
+
+def conversation_ids_from_detail(tabs, batch):
+    """Read an actual conversation identifier from an optional Converse Chat detail tab.
+
+    Message IDs and recipient IDs are intentionally NOT counted as conversations.
+    Empty result means the source cannot substantiate a unique-chat KPI.
+    """
+    cols = ['Batch', 'Conversation ID', 'ID Available']
+    id_heads = {'conversationid', 'chatid', 'chatthreadid', 'threadid',
+                'conversationsessionid', 'conversationuuid', 'chatsessionid'}
+    possible = []
+    for name, ws in tabs.items():
+        title = _norm_head(name)
+        if 'converse' in title and 'chat' in title and 'summary' not in title:
+            possible.append(ws)
+    for ws in possible:
+        try:
+            ix = None; header_row = 1
+            for row in (1,2,3):
+                headers = ws.row_values(row)
+                ix = next((i for i, value in enumerate(headers)
+                           if _norm_head(value) in id_heads), None)
+                if ix is not None:
+                    header_row = row
+                    break
+            if ix is None:
+                continue
+            ids = pd.Series(ws.col_values(ix + 1)[header_row:], dtype='str').str.strip()
+            ids = ids[ids.ne('') & ~ids.str.casefold().isin(['nan', 'none', 'null', 'n/a'])]
+            return pd.DataFrame({'Batch': batch, 'Conversation ID': ids.drop_duplicates().tolist() or [''], 'ID Available': True})
+        except Exception:
+            # A supplemental KPI must not interrupt the core reporting dashboard.
+            continue
+    return pd.DataFrame([{'Batch': batch, 'Conversation ID':'', 'ID Available':False}], columns=cols)
+
+
+def unique_chat_value(unique_data, scope_batches):
+    if unique_data is None or unique_data.empty:
+        return float('nan')
+    scoped = unique_data[unique_data['Batch'].isin(scope_batches)]
+    if scoped.empty:
+        return float('nan')
+    if not all((scoped.loc[scoped.Batch.eq(b), 'ID Available'] == True).any() for b in scope_batches):
+        return float('nan')
+    return float(scoped.loc[scoped['Conversation ID'].astype(str).str.strip().ne(''),'Conversation ID'].nunique())
+
 @st.cache_data(ttl=60,show_spinner=False)
 
 def load():
@@ -174,7 +224,7 @@ def load():
 
         raise RuntimeError(f'Credential setup: {type(exc).__name__}: {exc!s}' ) from exc
 
-    all_data={k:[] for k in ['transactions','email','wa','chat','senders','voucher']}
+    all_data={k:[] for k in ['transactions','email','wa','chat','senders','voucher','unique_chat']}
 
     for batch, secret_name in BOOKS.items():
         key = str(st.secrets['marketing_sheets'][secret_name]).strip()
@@ -217,6 +267,7 @@ def load():
         all_data['wa'] += [wa(r[2],batch,'Automation'),wa(r[3],batch,'Bulk')]
 
         all_data['chat'].append(wa(r[4],batch,'Converse Chat')); all_data['senders'].append(senders(r[5],batch))
+        all_data['unique_chat'].append(conversation_ids_from_detail(tabs, batch))
 
     return {k:pd.concat([x for x in v if not x.empty],ignore_index=True) if any(not x.empty for x in v) else v[0].iloc[0:0].copy() for k,v in all_data.items()}
 
@@ -365,19 +416,22 @@ def axis_max(v):
         if math.ceil(v/tick)<=5:return math.ceil(v/tick)*tick
     return result
 
-def svg_chart(d,x,y,group='Batch',kind='bar',width=480,height=210,secondary=None):
+def svg_chart(d,x,y,group='Batch',kind='bar',width=480,height=210,secondary=None,show_value_labels=False):
     """Responsive, accessible SVG chart. All chart coordinates derived from export data."""
     if d.empty or y not in d or d[y].notna().sum()==0:return empty('No chart data for this selection.')
-    z=d.copy();z=z[z[x].notna()]; cats=sorted(z[x].unique()) if x=='Month' else list(dict.fromkeys(z[x])); groups=list(dict.fromkeys(z[group]));
+    z=d.copy();z=z[z[x].notna()]; cats=sorted(z[x].unique()) if x in ('Month','CycleMonth') else list(dict.fromkeys(z[x])); groups=list(dict.fromkeys(z[group]));
     if group=='Batch':groups=[b for b in B if b in groups]
     colors={B[0]:GREEN,B[1]:PURPLE,'Delivered':GREEN,'Opened':ORANGE,'Read':ORANGE,'Sent':GREEN,'Emailer':GREEN,'WhatsApp':ORANGE}
     colors.update({k:colors.get(k,[GREEN,PURPLE,ORANGE][i%3]) for i,k in enumerate(groups)})
     legends=''.join(f'<span class="legenditem"><i class="legenddot" style="background:{colors[k]}"></i>{esc(k)}</span>' for k in groups)
     if secondary is not None:legends+=f'<span class="legenditem"><i class="legenddot" style="background:{PURPLE}"></i>Read rate</span>'
     # Fixed viewbox with generous axis margins. No clipped tick labels at narrow widths.
-    israte='rate' in y.casefold();left=43;right=46 if secondary is not None else 13;top=14; bottom=49 if x=='Month' and len(cats)>6 else 30
+    israte='rate' in y.casefold();left=43;right=46 if secondary is not None else 13;top=14; bottom=49 if x in ('Month','CycleMonth') and len(cats)>6 else 30
     plotw=width-left-right; ploth=height-top-bottom; y0=top+ploth
     maxv=float(z[y].max()); cap=axis_max(maxv*1.12 if kind=='bar' else maxv*1.08)
+    if y=='Transactions':
+        # Counts must use whole-number axis ticks (not fractional transactions).
+        cap=max(4, math.ceil(maxv/4)*4)
     if israte:cap=min(100,max(5,cap)) if maxv<=100 else cap
     cap=max(cap,1); bucket=plotw/max(len(cats),1)
     def xx(i):return left+bucket*(i+.5)
@@ -391,8 +445,8 @@ def svg_chart(d,x,y,group='Batch',kind='bar',width=480,height=210,secondary=None
     stride=max(1,math.ceil(len(cats)/10))
     for i,c in enumerate(cats):
         if i%stride and i!=len(cats)-1:continue
-        lab=monthlabel(c) if x=='Month' else str(c)
-        if x=='Month' and len(cats)>6:sv.append(text(xx(i),y0+13,lab,'end',9,transform=f'transform="rotate(-38 {xx(i):.2f} {y0+13:.2f})"'))
+        lab=(CYCLE_MONTHS[int(c)] if x=='CycleMonth' else monthlabel(c) if x=='Month' else str(c))
+        if x in ('Month','CycleMonth') and len(cats)>6:sv.append(text(xx(i),y0+13,lab,'end',9,transform=f'transform="rotate(-38 {xx(i):.2f} {y0+13:.2f})"'))
         else:sv.append(text(xx(i),y0+15,lab,'middle',9))
     sv.append(f'<line x1="{left}" y1="{y0}" x2="{width-right}" y2="{y0}" stroke="#aebdad"/>')
     look={(r[x],r[group]):r[y] for _,r in z.iterrows()}
@@ -406,11 +460,13 @@ def svg_chart(d,x,y,group='Batch',kind='bar',width=480,height=210,secondary=None
                     if len(points)>1:sv.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{colors[g]}" stroke-width="2.3" stroke-linejoin="round"/>')
                     points=[]
                 continue
-            cy=yy(v);cx=xx(i);tooltip=esc(f'{monthlabel(cats[i]) if x=="Month" else cats[i]} · {g}: {pct(v) if israte else fmt(v)}')
+            cy=yy(v);cx=xx(i);displaycat=(CYCLE_MONTHS[int(cats[i])] if x=='CycleMonth' else monthlabel(cats[i]) if x=='Month' else cats[i])
+            tooltip=esc(f'{displaycat} · {g}: {pct(v) if israte else fmt(v)}')
             if kind=='bar':
                 bx=cx+(j-(len(groups)-1)/2)*barw-barw*.46
                 sv.append(f'<rect x="{bx:.2f}" y="{cy:.2f}" width="{barw*.92:.2f}" height="{max(0,y0-cy):.2f}" rx="2" fill="{colors[g]}"><title>{tooltip}</title></rect>')
-                if len(cats)<=3:sv.append(text(bx+barw*.46,cy-5,brush(float(v)) if x=='Month' and maxv>10000 else fmt(v),'middle',10,colors[g],'600'))
+                if len(cats)<=3 or show_value_labels:
+                    sv.append(text(bx+barw*.46,max(10,cy-5),brush(float(v)) if x=='Month' and maxv>10000 else fmt(v),'middle',10,colors[g],'600'))
             else:
                 points.append(f'{cx:.2f},{cy:.2f}');sv.append(f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="3.5" fill="white" stroke="{colors[g]}" stroke-width="2"><title>{tooltip}</title></circle>')
         if kind=='line' and len(points)>1:sv.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{colors[g]}" stroke-width="2.3" stroke-linejoin="round"/>')
@@ -912,6 +968,36 @@ st.markdown('<style>'+CSS_STRUCTURAL_ALIGNMENT+'</style>', unsafe_allow_html=Tru
 
 
 
+
+CSS_DOCX_CORRECTIONS = r"""
+/* DOCX correction 1: two Converse Chat KPIs, not one over-stretched count. */
+#section-1 .chat-double{min-height:138px!important;padding:12px 14px!important;gap:7px!important}
+#section-1 .chat-double .klabel{font-size:11px;min-height:auto!important;margin:0!important}
+.chat-pair{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:end;margin-top:auto}
+.chat-pair>div+div{border-left:1px solid #638773;padding-left:10px}
+.chat-value{font-size:clamp(20px,1.7vw,29px);font-weight:760;line-height:1.1;color:white;font-variant-numeric:tabular-nums}
+.chat-caption{color:#dbe9de;font-size:10px;line-height:1.3;margin-top:4px}
+.chat-method{font-size:9px;line-height:1.25;color:#d3e2d6}
+/* DOCX correction 3: two equal-width channel-specific monthly transaction tables. */
+.tx-month-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:stretch}
+.tx-month-grid>.panel{min-width:0;display:flex;flex-direction:column;gap:4px}
+.tx-month-grid .tablebox{max-height:430px;overflow:auto}
+.tx-month-grid .report th{position:sticky;top:0;z-index:2}
+.tx-month-grid .report td:first-child,.tx-month-grid .report th:first-child{text-align:left!important}
+.tx-month-grid .report tr:last-child td{background:#e2ebd1!important;font-weight:750}
+/* DOCX 4-6: each campaign type has a clear section label and two graphs. */
+#section-3 .chart-subhead,#section-4 .chart-subhead{font-weight:750;font-size:13px;margin:2px 0 0!important}
+#section-3 .monthly-pair,#section-4 .monthly-pair{align-items:stretch;gap:12px}
+#section-3 .monthly-pair>.panel,#section-4 .monthly-pair>.panel{min-height:238px!important;display:flex;flex-direction:column}
+#section-3 .monthly-pair .plot,#section-4 .monthly-pair .plot{flex:1 1 auto;display:flex;flex-direction:column;justify-content:center}
+#section-3 .monthly-pair .plot svg,#section-4 .monthly-pair .plot svg{max-height:206px!important;width:100%!important}
+#section-3 .section-grid>.leftstack,#section-4 .section-grid>.leftstack{gap:8px!important}
+#section-2 .tx-top .panel-sub{line-height:1.35}
+@media(max-width:950px){.tx-month-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:680px){.tx-month-grid,#section-3 .monthly-pair,#section-4 .monthly-pair{grid-template-columns:minmax(0,1fr)!important}.chat-double .chat-pair{grid-template-columns:1fr 1fr}}
+"""
+st.markdown('<style>'+CSS_DOCX_CORRECTIONS+'</style>',unsafe_allow_html=True)
+
 def navigation():
     st.markdown(brand_html(), unsafe_allow_html=True)
 
@@ -976,14 +1062,22 @@ def breakdown_table(d,channel):
     return table(a,True)
 
 
-def overview(t,e,w,ch,same):
+def overview(t,e,w,ch,same,unique_chats=None,chat_batches=None):
     counts=pair_counts(t.assign(_n=1),'_n');em=pair_counts(t[t.Source.eq('Emailer')].assign(_n=1),'_n');wa_count=pair_counts(t[t.Source.eq('WhatsApp')].assign(_n=1),'_n')
     er=pairrate(e,'Opened','Delivered'); ecr=pairrate(e,'Clicked','Delivered')
     wr=pairrate(w,'Read','Delivered'); wcr=pairrate(w,'Clicked','Delivered')
     cc=total(ch,'Triggered')
+    unique_n=unique_chat_value(unique_chats,chat_batches or B)
     row1=cards([kpi('Combined (Emailer + WhatsApp) Transactions',counts,'layers','primary'),kpi('Emailer Transactions',em,'mail'),kpi('WhatsApp Transactions',wa_count,'wa')])
     row2=cards([kpi('Email Overall Open Rate',er,'mail',percent=True),kpi('Email Overall Click Rate',ecr,'chart',percent=True),kpi('WhatsApp Overall Read Rate',wr,'wa',percent=True),kpi('WhatsApp Overall Click Rate',wcr,'chart','accent',True)],'four')
-    chat=kpi('Total Converse Chats',cc,'chat','primary',sub='Triggered messages · not unique conversations')
+    # A two-KPI card replaces the old tall single-number panel; it remains aligned
+    # with the neighbouring Automation-vs-Bulk summary cards.
+    chat=div(
+        '<div class="klabel">'+icon('chat','#cde9b0',21)+'Converse Chat · Messages & Conversations</div>'+
+        '<div class="chat-pair"><div><div class="chat-value">'+fmt(cc)+'</div><div class="chat-caption">Total triggered messages</div></div>'+
+        '<div><div class="chat-value">'+fmt(unique_n)+'</div><div class="chat-caption">Unique chats'+(' · unavailable' if pd.isna(unique_n) else '')+'</div></div></div>'+
+        '<div class="chat-method">Distinct conversation IDs, when the detail export provides them</div>',
+        'kpi primary chat-double')
     bottom=div(chat+panel('Email · Automation vs Bulk',breakdown_table(e,'email'),'mail')+panel('WhatsApp · Automation vs Bulk',breakdown_table(w,'wa'),'wa'),'overview-bottom')
     left=row1+row2+bottom
     anu=pairrate(e[e.Type.eq('Automation')],'Opened','Delivered');wau=pairrate(w[w.Type.eq('Automation')],'Read','Delivered')
@@ -991,10 +1085,9 @@ def overview(t,e,w,ch,same):
            ('Email engagement',f'Open {pct(er[0])} LY → {pct(er[1])} CY; click {pct(ecr[0])} → {pct(ecr[1])}.'),
            ('WhatsApp engagement',f'Read {pct(wr[0])} LY → {pct(wr[1])} CY; click {pct(wcr[0])} → {pct(wcr[1])}.'),
            ('Automation comparison',f'Email opens {pct(anu[0])} → {pct(anu[1])}; WhatsApp reads {pct(wau[0])} → {pct(wau[1])}.'),
-           ('Converse Chat',f'{fmt(cc)} triggered messages. Unique conversations cannot be inferred.'),
+           ('Converse Chat',f'{fmt(cc)} triggered messages · {fmt(unique_n)} unique chats.' if pd.notna(unique_n) else f'{fmt(cc)} triggered; unique count requires conversation IDs in a Converse Chat detail tab.'),
            ('Comparison scope','Full export periods differ across batches; not matched-period YoY.')]
     return section(1,'Executive Overview','grid',left,insight(items))
-
 
 def nested_transaction_table(t):
     """A single Source → Medium → Campaign drill-down table; counts by row, not invented mediums."""
@@ -1017,6 +1110,43 @@ def nested_transaction_table(t):
     return ''.join(html_)
 
 
+
+CYCLE_MONTHS = ['Sep','Oct','Nov','Dec','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug']
+
+def cycle_month_index(date_series):
+    dt=pd.to_datetime(date_series,errors='coerce')
+    return (dt.dt.month-9)%12
+
+
+def cycle_rate_data(d, metric):
+    """Weighted rates for matching months, rather than disjoint year-month axes."""
+    if d.empty:
+        return pd.DataFrame(columns=['Batch','CycleMonth','Rate'])
+    a=d.copy();a['CycleMonth']=cycle_month_index(a['Date'])
+    a=a.dropna(subset=['CycleMonth'])
+    if a.empty:return pd.DataFrame(columns=['Batch','CycleMonth','Rate'])
+    a['CycleMonth']=a['CycleMonth'].astype(int)
+    g=a.groupby(['Batch','CycleMonth'])[['Delivered',metric]].sum(min_count=1).reset_index()
+    g['Rate']=rate(g[metric],g['Delivered'])
+    return g[['Batch','CycleMonth','Rate']]
+
+
+def monthly_channel_comparison(t, source):
+    """Side-by-side LY and CY transaction counts for Sep–Aug reporting months."""
+    a=t[t.Source.eq(source)].copy()
+    if a.empty:return pd.DataFrame(columns=['Month']+B+['Total'])
+    a['CycleMonth']=cycle_month_index(a.Date)
+    a=a.dropna(subset=['CycleMonth'])
+    a['CycleMonth']=a.CycleMonth.astype(int)
+    g=a.groupby(['CycleMonth','Batch']).size().unstack(fill_value=0).reindex(columns=B,fill_value=0)
+    # Show months present in either cycle only; don't invent future observations.
+    g=g.sort_index().reset_index()
+    g['Month']=g.CycleMonth.map(dict(enumerate(CYCLE_MONTHS)))
+    g['Total']=g[B].sum(axis=1)
+    out=g[['Month']+B+['Total']]
+    tot=pd.DataFrame([{'Month':'Total',B[0]:int(out[B[0]].sum()),B[1]:int(out[B[1]].sum()),'Total':int(out.Total.sum())}])
+    return pd.concat([out,tot],ignore_index=True)
+
 def transaction_section(t, batch, source, medium, start, end, query):
     invalid=bool(start and end and start>end)
     if invalid:start=end=None
@@ -1025,35 +1155,41 @@ def transaction_section(t, batch, source, medium, start, end, query):
     if end:tt=tt[tt.Date<pd.Timestamp(end)+pd.Timedelta(days=1)]
     if source!='All sources':tt=tt[tt.Source.eq(source)]
     if medium!='All mediums':tt=tt[tt.Medium.eq(medium)]
-    monthly_source=monthly(tt[tt.Batch.eq(batch)]).groupby(['Month','Source']).size().reset_index(name='Transactions')
-    # Always plot both channel lines on the same months; a confirmed absent channel is zero.
+    selected=tt[tt.Batch.eq(batch)]
+    monthly_source=monthly(selected).groupby(['Month','Source']).size().reset_index(name='Transactions')
     if len(monthly_source):
         ix=pd.MultiIndex.from_product([sorted(monthly_source.Month.unique()),['Emailer','WhatsApp']],names=['Month','Source'])
         monthly_source=monthly_source.set_index(['Month','Source']).reindex(ix,fill_value=0).reset_index()
     ly=tt[tt.Batch.eq(B[0])];cy=tt[tt.Batch.eq(B[1])]
-    pie=tt[tt.Batch.eq(batch)].groupby('Source').size().reset_index(name='Transactions')
-    source_comparison=tt.groupby(['Batch','Source']).size().reset_index(name='Transactions')
-    chart1=panel('Monthly Transactions · Emailer vs WhatsApp',svg_chart(monthly_source,'Month','Transactions',group='Source',kind='line',width=640,height=215), 'chart',sub=f'{batch} · Transaction Date · source-level trends',extra='panel-fill')
-    chart2=panel('Channel Contribution',donut(pie),'pie',sub=f'{batch} · selected date/source/medium scope',extra='panel-fill')
+    pie=selected.groupby('Source').size().reset_index(name='Transactions')
+    # Direct value labels + count-specific heading make very small transaction numbers legible.
+    chart1=panel('Monthly Transactions · Emailer vs WhatsApp',
+                 svg_chart(monthly_source,'Month','Transactions',group='Source',kind='bar',width=640,height=218,show_value_labels=True),
+                 'chart',sub=f'{batch} · transaction count by month · Green = Emailer / Orange = WhatsApp',extra='panel-fill')
+    chart2=panel('Channel Contribution',donut(pie),'pie',sub=f'{batch} · selected filter scope',extra='panel-fill')
     charts=div(chart1+chart2,'tx-top')
-    chart3=panel('Emailer vs WhatsApp · LY and CY',svg_chart(source_comparison,'Source','Transactions',group='Batch',kind='bar',width=600,height=195),'chart')
-    m=monthly(tt).groupby(['Batch','Month','Source']).size().reset_index(name='Transactions')
-    md=m.pivot_table(index=['Month','Source'],columns='Batch',values='Transactions',aggfunc='sum',fill_value=0).reindex(columns=B,fill_value=0).reset_index() if not m.empty else pd.DataFrame(columns=['Month','Source']+B)
-    details=panel('Month-wise Transaction Detail',table(md),'calendar',extra='month-table')
+    email_month=monthly_channel_comparison(tt,'Emailer')
+    wa_month=monthly_channel_comparison(tt,'WhatsApp')
+    # Exactly two consistent monthwise tables as requested in the redlined document.
+    detail_tables=div(
+        panel('Emailer · Month-wise Transactions',table(email_month),'mail',sub='Sep–Aug aligned months · LY vs CY')+
+        panel('WhatsApp · Month-wise Transactions',table(wa_month),'wa',sub='Sep–Aug aligned months · LY vs CY'),
+        'tx-month-grid')
     search_t=tt[tt.Campaign.str.contains(query,case=False,regex=False)] if query else tt
-    left=charts+panel('Transaction Attribution · Source → Medium → Campaign',nested_transaction_table(search_t),'table',sub='Click the arrow beside a source, then a medium to view its campaigns')
+    left=charts+panel('Transaction Attribution · Source → Medium → Campaign',nested_transaction_table(search_t),'table',sub='Expand source and medium to see actual campaign counts')
     lead=tt.Source.value_counts();leading=lead.index[0] if len(lead) else 'Unavailable'
-    peak=m.sort_values('Transactions',ascending=False) if len(m) else m
-    unknown=int(tt.Medium.eq('Not specified').sum())
-    coverage=ratio(len(tt)-unknown,len(tt))
+    monthly_count=monthly(tt).groupby(['Month','Source']).size().reset_index(name='Transactions')
+    peak=monthly_count.sort_values('Transactions',ascending=False) if len(monthly_count) else monthly_count
+    unknown=int(tt.Medium.eq('Not specified').sum());coverage=ratio(len(tt)-unknown,len(tt))
     right=insight([('Total transactions',f'{fmt(len(ly))} LY · {fmt(len(cy))} CY.'),
-                   ('Most attributed channel',f'{leading} · {fmt(lead.iloc[0])} transactions.' if len(lead) else 'No data.'),
+                   ('Leading channel',f'{leading} · {fmt(lead.iloc[0])} transactions.' if len(lead) else 'No data.'),
                    ('Peak month',f'{monthlabel(peak.iloc[0].Month)} · {peak.iloc[0].Source} · {fmt(peak.iloc[0].Transactions)}.' if len(peak) else 'No data.'),
                    ('Medium completeness',f'{pct(coverage)} specified · {fmt(unknown)} not specified.'),
-                   ('Source hierarchy','Click Source → Medium → Campaign to expand in the same table.')],
-                  foot='Exact marketing source classification; date range and source/medium selections apply to this section.')
-    return section(2,'Transaction Performance','chart',left,right,details=div(chart3+details,'tx-bottom'),footer=note('Start date exceeds end date; showing all dates.') if invalid else '')
-
+                   ('Monthwise comparison','Emailer and WhatsApp have independent LY/CY month tables below.')],
+                  foot='Transactions use Transaction Date. Filters apply to charts and tables; Search applies to the hierarchy only.')
+    return section(2,'Transaction Performance','chart',left,right,
+                   details=detail_tables,
+                   footer=note('Start date exceeds end date; showing all dates.') if invalid else '')
 
 def ranked_all(d, metric):
     """All campaigns, weighted sums by campaign/subject; independent open/read vs click rankings."""
@@ -1075,9 +1211,8 @@ def ranked_all(d, metric):
 
 def channel_section(d, is_email, batch, kind, query):
     channel='Email' if is_email else 'WhatsApp';index=3 if is_email else 4
-    metric='Opened' if is_email else 'Read'; ico='mail' if is_email else 'wa'; m=EM if is_email else WM
+    metric='Opened' if is_email else 'Read';ico='mail' if is_email else 'wa';m=EM if is_email else WM
     summary=aggregate(d,['Batch','Type'],m,numer=metric)
-    # Retain unavailable batches as blank, not zero.
     def compact_type(typ):
         z=summary[summary.Type.eq(typ)].set_index('Batch').reindex(B).rename_axis('Batch').reset_index()
         fields=['Batch','Delivered',metric,'Rate','Clicked','Click rate']
@@ -1089,55 +1224,69 @@ def channel_section(d, is_email, batch, kind, query):
         mask=selected.Campaign.str.contains(query,case=False,regex=False)
         if is_email:mask=mask|selected.Subject.str.contains(query,case=False,regex=False)
         selected=selected[mask]
-    # Four full rankings per channel: Automation Open/Read + Click, Bulk Open/Read + Click.
-    rank_html=[]; ranks={}
+    rank_html=[];ranks={}
     for typ in ['Automation','Bulk']:
         current=d[d.Batch.eq(batch)&d.Type.eq(typ)]
         if query:
             mask=current.Campaign.str.contains(query,case=False,regex=False)
             if is_email:mask=mask|current.Subject.str.contains(query,case=False,regex=False)
             current=current[mask]
-        open_rank=ranked_all(current,metric)
-        click_rank=ranked_all(current,'Clicked')
+        open_rank=ranked_all(current,metric);click_rank=ranked_all(current,'Clicked')
         ranks[typ]=(open_rank,click_rank)
         head=div(esc(typ+' · Full Campaign Rankings  |  '+batch+' · '+fmt(len(open_rank))+' campaigns'),'subhead')
         rank_html.append(head+div(
-            panel('All campaigns · '+('Open Rate' if is_email else 'Read Rate'),table(open_rank),'trophy',sub='All campaigns · sorted by delivered-based rate (small bases can rank first)')+
-            panel('All campaigns · Click Rate',table(click_rank),'trophy',sub='All campaigns · sorted by delivered-based rate (small bases can rank first)'), 'rank-pair'))
-    volume=aggregate(monthly(d[d.Batch.eq(batch)&d.Type.eq(kind)]),['Month'],m,numer=metric)
-    trend=aggregate(monthly(d[d.Type.eq(kind)]),['Batch','Month'],m,numer=metric)
-    if not volume.empty:
-        melted=volume.melt(id_vars='Month',value_vars=['Delivered',metric],var_name='Metric',value_name='Volume')
-        vplot=svg_chart(melted,'Month','Volume',group='Metric',kind='bar',width=500,height=210)
-    else:vplot=empty('No monthly volume data for this batch and campaign type.')
-    tr=svg_chart(trend,'Month','Rate',kind='line',width=500,height=210)
-    charts=div(panel('Monthly Delivered & '+metric,vplot,'chart',sub=f'{batch} · {kind}')+
-               panel('Monthly '+('Open Rate' if is_email else 'Read Rate')+' · LY vs CY',tr,'chart',sub=kind+' · full-cycle months'),'reports-row')
-    left=header+charts
-    overall=pairrate(d,metric,'Delivered'); clicks=pairrate(d,'Clicked','Delivered')
+            panel('All campaigns · '+('Open Rate' if is_email else 'Read Rate'),table(open_rank),'trophy',sub='Complete ranking by delivered-based rate; check volume alongside rate')+
+            panel('All campaigns · Click Rate',table(click_rank),'trophy',sub='Complete ranking by delivered-based click rate'), 'rank-pair'))
+
+    # Each channel gets TWO pairs: Automation volume+rate and Bulk volume+rate.
+    # The LY and CY lines are plotted on the SAME Sep–Aug month-of-cycle axis.
+    chart_rows=[]
+    for typ in ['Automation','Bulk']:
+        typ_data=d[d.Type.eq(typ)]
+        volume=aggregate(monthly(typ_data[typ_data.Batch.eq(batch)]),['Month'],m,numer=metric)
+        if not volume.empty:
+            melted=volume.melt(id_vars='Month',value_vars=['Delivered',metric],var_name='Metric',value_name='Volume')
+            vplot=svg_chart(melted,'Month','Volume',group='Metric',kind='bar',width=520,height=210,show_value_labels=True)
+        else:
+            vplot=empty(f'{batch} {channel} {typ}: data unavailable for this export.')
+        trend=cycle_rate_data(typ_data,metric)
+        if trend.empty:
+            tr=empty(f'No {typ} month-on-month rates are available for either batch.')
+        else:
+            tr=svg_chart(trend,'CycleMonth','Rate',group='Batch',kind='line',width=520,height=210)
+        tag=div(typ+' · Monthly Engagement  |  '+batch,'subhead chart-subhead')
+        row=div(
+            panel('Monthly Delivered & '+metric,vplot,'chart',sub=f'{batch} · {typ} · delivered vs '+metric.lower(),extra='panel-fill')+
+            panel('Monthly '+('Open Rate' if is_email else 'Read Rate')+' · LY vs CY',tr,'chart',sub='Sep–Aug · same calendar months across both batches',extra='panel-fill'),
+            'reports-row monthly-pair')
+        chart_rows.append(tag+row)
+    left=header+''.join(chart_rows)
+    overall=pairrate(d,metric,'Delivered');clicks=pairrate(d,'Clicked','Delivered')
     a=pairrate(d[d.Type.eq('Automation')],metric,'Delivered');b=pairrate(d[d.Type.eq('Bulk')],metric,'Delivered')
-    toplist=ranks[kind][0]
-    top=toplist.iloc[0] if not toplist.empty else None
+    toplist=ranks[kind][0];top=toplist.iloc[0] if not toplist.empty else None
     items=[('Overall '+('open' if is_email else 'read')+' rate',f'{pct(overall[0])} LY → {pct(overall[1])} CY ({change(*overall)}).'),
            ('Overall click rate',f'{pct(clicks[0])} LY → {pct(clicks[1])} CY ({change(*clicks)}).'),
            ('Automation '+('open' if is_email else 'read')+' rate',f'{pct(a[0])} LY → {pct(a[1])} CY.'),
            ('Bulk '+('open' if is_email else 'read')+' rate',f'{pct(b[0])} LY → {pct(b[1])} CY.'),
            ('Selected batch/type',f'{batch} · {kind}: {fmt(total(selected,"Delivered"))} delivered, {fmt(total(selected,metric))} '+metric.lower()+'; '+pct(ratio(total(selected,metric),total(selected,'Delivered')))+'.'),
-           ('Highest '+('open' if is_email else 'read')+' rate',f'{top["Campaign / Subject"][0]} · {pct(top["Open rate" if is_email else "Read rate"])} on {fmt(top.Delivered)} deliveries.' if top is not None else 'Unavailable.')]
-    if not is_email and not len(d[d.Batch.eq(B[1])&d.Type.eq('Bulk')]):items.append(('Bulk data coverage','CY WhatsApp Bulk export unavailable; reported as —, not 0.'))
-    foot='Automation opens/clicks are estimated as delivered × exported %; Bulk uses counts.' if is_email else 'Read and Click rates use Delivered denominator; missing exports are unavailable.'
+           ('Highest '+('open' if is_email else 'read')+' rate',f'{top["Campaign / Subject"][0]} · {pct(top["Open rate" if is_email else "Read rate"])} on {fmt(top.Delivered)} deliveries.' if top is not None else 'Unavailable.'),
+           ('Monthly comparison','Automation and Bulk each show delivered volume plus month-aligned LY/CY rates.')]
+    if not is_email and not len(d[d.Batch.eq(B[1])&d.Type.eq('Bulk')]):
+        items.append(('Bulk data coverage','CY WhatsApp Bulk export unavailable; reported as —, not 0.'))
+    foot='Email Automation opens/clicks are estimated as delivered × exported %; Bulk uses counts.' if is_email else 'Read and Click rates use Delivered denominator; missing exports are unavailable.'
     return section(index,channel+' Campaign Performance',ico,left,insight(items,foot=foot),details=''.join(rank_html))
 
-
-def converse(ch,same,batch):
+def converse(ch,same,batch,unique_chats=None,chat_batches=None):
     x=ch if same else ch[ch.Batch.eq(batch)]
     delivered=total(x,'Delivered');read=total(x,'Read');triggered=total(x,'Triggered')
+    unique_n=unique_chat_value(unique_chats,chat_batches or B)
     m=aggregate(monthly(x),['Month'],WM,numer='Read')
     overall=aggregate(x.assign(Month='Overall'),['Month'],WM,numer='Read')
-    k=cards([kpi('Triggered chat messages',triggered,'send','primary',sub='Not unique conversations'),
+    k=cards([kpi('Triggered chat messages',triggered,'send','primary',sub='Messages, not unique chats'),
+             kpi('Unique chats',unique_n,'users',sub='Distinct conversation IDs if available'),
              kpi('Delivered',delivered,'check',sub='Available export'),
              kpi('Read',read,'chat',sub='Available export'),
-             kpi('Read rate',ratio(read,delivered),'pie','accent',True,sub='Read ÷ Delivered')],'four')
+             kpi('Read rate',ratio(read,delivered),'pie','accent',True,sub='Read ÷ Delivered')],'five')
     data=pd.concat([m,overall],ignore_index=True)[['Month','Triggered','Delivered','Read','Rate']].rename(columns={'Rate':'Read rate'}) if len(m) else pd.DataFrame(columns=['Month','Triggered','Delivered','Read','Read rate'])
     melted=m.melt(id_vars='Month',value_vars=['Delivered','Read'],var_name='Metric',value_name='Volume') if len(m) else pd.DataFrame(columns=['Month','Metric','Volume'])
     curve=svg_chart(melted,'Month','Volume','Metric',kind='bar',width=540,height=210,secondary=dict(zip(m.Month,m.Rate)) if len(m) else None)
@@ -1149,6 +1298,7 @@ def converse(ch,same,batch):
                    ('Read performance',f'{fmt(read)} read / {fmt(delivered)} delivered · {pct(ratio(read,delivered))}.'),
                    ('Best month',f'{monthlabel(best.Month)} · {pct(best.Rate)}.' if best is not None else 'Unavailable.'),
                    ('Lowest month',f'{monthlabel(worst.Month)} · {pct(worst.Rate)}.' if worst is not None else 'Unavailable.'),
+                   ('Unique chats',f'{fmt(unique_n)} distinct conversation IDs.' if pd.notna(unique_n) else 'Not available: no supported chat/conversation ID field in the detail export.'),
                    ('Metric definition','Triggered messages are not necessarily unique chat conversations.')],
                   foot='Same monthly summary across batches is counted only once.')
     return section(5,'Converse Chat Performance','chat',k+main,right)
@@ -1201,15 +1351,17 @@ def voucher_section(v,order,query):
 
 def render_report(data,batch,kind,source,medium,start,end,query,voucher_order,checked):
     t,e,w,ch,s,v=[data[k] for k in ['transactions','email','wa','chat','senders','voucher']]
+    unique_chats=data.get('unique_chat',pd.DataFrame(columns=['Batch','Conversation ID','ID Available']))
     ca=aggregate(monthly(ch),['Batch','Month'],WM,numer='Read')
     p=ca[ca.Batch.eq(B[0])].drop(columns='Batch').reset_index(drop=True)
     q=ca[ca.Batch.eq(B[1])].drop(columns='Batch').reset_index(drop=True)
     same=p.equals(q) and not p.empty
     cv=ch[ch.Batch.eq(B[1])] if same else ch[ch.Batch.eq(batch)]
     status='<div class="statusline"><span><b>● Google Sheets connected</b> · '+esc(checked)+'</span><span>Auto-refresh 60s · '+esc(batch)+' · '+esc(kind)+'</span></div>'
-    parts=[overview(t,e,w,cv,same),transaction_section(t,batch,source,medium,start,end,query),
+    chat_batches=B if same else [batch]
+    parts=[overview(t,e,w,cv,same,unique_chats,chat_batches),transaction_section(t,batch,source,medium,start,end,query),
            channel_section(e,True,batch,kind,query),channel_section(w,False,batch,kind,query),
-           converse(cv,same,batch),sender_section(s,batch,query),voucher_section(v,voucher_order,query)]
+           converse(cv,same,batch,unique_chats,chat_batches),sender_section(s,batch,query),voucher_section(v,voucher_order,query)]
     return '<div class="mi-top">'+status+'</div><div class="mi">'+''.join(parts)+ '<div class="footer">Source: Google Sheets only · Automatic refresh every 60s while open · Full-cycle LY/CY comparisons are not matched reporting periods · — = unavailable, not zero</div></div>'
 
 @st.fragment(run_every='60s')
