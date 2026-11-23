@@ -627,6 +627,143 @@ CSS_FILTER_TOOLBAR = """
 """
 st.markdown('<style>'+CSS_FILTER_TOOLBAR+'</style>', unsafe_allow_html=True)
 
+# Layout polish only: no reporting, credentials, or filter logic changes.
+CSS_ALIGNMENT_FINAL = r"""
+/* =============================================================
+   NOV-2026 ALIGNMENT FIX — PRESENTATION ONLY
+   1. Reduce unused Streamlit top space.
+   2. Align reporting and insight columns at their top edge.
+   3. Prevent right-side cards and tables from stretching to
+      artificial heights, especially Sender and Voucher reports.
+   4. Consistent chart/table rows, compact gaps, responsive layout.
+   ============================================================= */
+/* Streamlit layout: remove the default toolbar/header reservation. */
+html,body{margin:0!important}
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+section.main{padding-top:0!important;margin-top:0!important}
+[data-testid="stMainBlockContainer"],
+[data-testid="stAppViewBlockContainer"],
+section.main>.block-container,
+.block-container{
+  padding-top:4px!important;
+  padding-bottom:22px!important;
+}
+/* Top branding/filter density: preserve same native controls. */
+.brand{padding:0 0 8px!important;gap:18px!important}
+.brand img{max-width:162px!important}
+.brand-text{padding-left:18px!important}
+.brand-name{line-height:1.15!important}
+.mi-nav{padding:0!important;margin:0!important}
+.mi-top{margin:0!important;padding:0!important}
+[data-testid="stVerticalBlock"]{gap:.46rem!important}
+[data-testid="stVerticalBlockBorderWrapper"]>div{padding-top:0!important;padding-bottom:0!important}
+.filter-note{margin:0!important}
+.statusline{padding:3px 0 6px!important}
+/* Compact regular rhythm, without a large empty gap between sections. */
+.mi{gap:15px!important;padding-top:3px!important}
+.section:not(:first-child){padding-top:13px!important}
+.sectitle,.mi .sectitle{margin-bottom:10px!important}
+.section-wide{margin-top:10px!important;gap:10px!important}
+/* Fixed proportional reporting/insights widths, natural heights. */
+.section-grid{
+  display:grid!important;
+  grid-template-columns:minmax(0,1fr) minmax(285px,24%)!important;
+  align-items:start!important;
+  gap:12px!important;
+}
+.section-grid>.leftstack,
+.section-grid>.rightstack{
+  min-width:0!important;
+  min-height:0!important;
+  height:auto!important;
+  align-self:start!important;
+  display:flex!important;
+  flex-direction:column!important;
+  gap:10px!important;
+}
+.section-grid>.leftstack>*,.section-grid>.rightstack>*{flex-shrink:0}
+.section-grid>.rightstack>.insight{
+  flex:0 0 auto!important;
+  height:auto!important;
+  min-height:0!important;
+  align-self:stretch!important;
+  justify-content:flex-start!important;
+  padding:11px!important;
+}
+.rightstack .insight-items{
+  display:grid!important;
+  grid-template-columns:minmax(0,1fr)!important;
+  grid-auto-rows:max-content!important;
+  align-content:start!important;
+  gap:7px!important;
+  flex:initial!important;
+  min-height:0!important;
+}
+.rightstack .insight-row{
+  display:block!important;
+  height:auto!important;
+  min-height:0!important;
+  padding:9px 10px!important;
+  line-height:1.35!important;
+}
+.rightstack .insight-row b{line-height:1.25!important;margin-bottom:3px!important}
+.rightstack .insight-value{line-height:1.4!important;overflow-wrap:anywhere}
+.rightstack .insight-note{margin-top:8px!important}
+/* Tables/charts: independent content-based heights, rows match naturally. */
+.section-grid .aligned-main,
+.section-grid .leftstack>.aligned-main{flex:0 0 auto!important;height:auto!important}
+.aligned-main>.panel,.aligned-main>.converse-pair{flex:0 0 auto!important;height:auto!important}
+.aligned-main>.panel>.tablebox,
+.converse-pair>.panel>.tablebox{flex:initial!important;display:block!important;height:auto!important}
+.aligned-main>.panel>.tablebox>.report,
+.converse-pair>.panel>.tablebox>.report{height:auto!important}
+.tx-top,.tx-bottom,.reports-row,.rank-pair,.converse-pair{
+  align-items:stretch!important;
+  grid-auto-rows:auto!important;
+  gap:11px!important;
+}
+.tx-top>.panel,.tx-bottom>.panel,.reports-row>.panel,
+.rank-pair>.panel,.converse-pair>.panel{height:100%;min-width:0}
+.panel{min-width:0!important;border-radius:9px!important;padding:12px!important}
+.panel h3{margin-bottom:8px!important}
+.panel-fill .plot{margin:0!important}
+/* No artificially taller SVG charts. */
+.chartstack .plot svg,.tx-top .plot svg{max-height:215px!important}
+.reports-row .plot svg{max-height:225px!important}
+/* Narrow table/card alignment and scroll contained inside the panel. */
+.tablebox{max-width:100%!important;min-width:0!important}
+.rank-pair .tablebox{max-height:370px!important;overflow:auto!important}
+.voucher-rank .tablebox{max-height:480px!important;overflow:auto!important}
+.month-table .tablebox{max-height:280px!important;overflow:auto!important}
+.report th,.report td{vertical-align:middle!important}
+.report .txt{text-align:left!important}
+.report .num{text-align:right!important;font-variant-numeric:tabular-nums}
+/* Preserve readable widths below desktop breakpoint; insight is below report. */
+@media(max-width:1150px){
+  .section-grid{grid-template-columns:minmax(0,1fr) minmax(225px,25%)!important;gap:10px!important}
+  .brand img{max-width:142px!important}
+}
+@media(max-width:1000px){
+  .section-grid{grid-template-columns:minmax(0,1fr)!important}
+  .section-grid>.rightstack{align-self:stretch!important}
+  .rightstack .insight-items{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .section-grid>.rightstack>.insight{height:auto!important}
+}
+@media(max-width:680px){
+  [data-testid="stMainBlockContainer"],.block-container{padding:3px 12px 18px!important}
+  .section-grid{gap:9px!important}
+  .rightstack .insight-items{grid-template-columns:minmax(0,1fr)!important}
+  .tx-top,.tx-bottom,.reports-row,.rank-pair,.converse-pair{grid-template-columns:minmax(0,1fr)!important}
+  .panel{padding:10px!important}
+  .brand{gap:10px!important}
+  .brand-text{padding-left:0!important}
+  .mi{gap:13px!important}
+}
+"""
+st.markdown('<style>'+CSS_ALIGNMENT_FINAL+'</style>', unsafe_allow_html=True)
+
+
 
 def navigation():
     st.markdown(brand_html(), unsafe_allow_html=True)
